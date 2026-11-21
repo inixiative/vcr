@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { constants as osConstants, tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import { VcrError } from '../core/errors';
 import type { VcrRecorder } from '../core/recorder';
@@ -21,7 +21,12 @@ export interface ProcessTranscript {
   readonly stdin: string[];
   stdinEnded: boolean;
   frames: ProcessFrame[];
-  exit: { readonly after: number; readonly code: number | null; readonly killed: boolean };
+  exit: {
+    readonly after: number;
+    readonly code: number | null;
+    readonly killed: boolean;
+    readonly signal?: string;
+  };
 }
 
 export interface ProcessSpawnOptions {
@@ -92,9 +97,6 @@ export interface VcrProcessSpawner {
 
 const encoder = new TextEncoder();
 
-const decodeChunk = (data: string | Uint8Array): string =>
-  typeof data === 'string' ? data : new TextDecoder().decode(data);
-
 interface JsonRpcLike {
   readonly id?: string | number;
   readonly method?: string;
@@ -155,10 +157,21 @@ export const jsonRpcLineProtocol: ProcessLineProtocol = {
   },
 };
 
+const signalExitCode = (signal: NodeJS.Signals | null | undefined): number => {
+  if (!signal) return 1;
+  const signals = osConstants.signals as Readonly<Record<string, number | undefined>>;
+  const num = signals[signal];
+  return typeof num === 'number' ? 128 + num : 1;
+};
+
+interface InternalLiveProcess extends RecordedProcess {
+  readonly exitSignal?: () => string | undefined;
+}
+
 const spawnDefaultLiveProcess = (
   argv: readonly string[],
   options: ProcessSpawnOptions,
-): RecordedProcess => {
+): InternalLiveProcess => {
   const [command, ...args] = argv;
   if (!command) {
     throw new VcrError('invalid_cassette', 'VCR process: argv must contain at least one element');
@@ -190,6 +203,7 @@ const spawnDefaultLiveProcess = (
       kill() {
         child.kill();
       },
+      exitSignal: () => (child.signalCode ? String(child.signalCode) : undefined),
     };
   }
 
@@ -198,8 +212,15 @@ const spawnDefaultLiveProcess = (
     env: options.env,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  // Guard against EPIPE when child exits before stdin finishes writing.
+  child.stdin.on('error', () => {});
+
+  let observedSignal: string | undefined;
   const exited = new Promise<number>((resolve) => {
-    child.on('exit', (code) => resolve(code ?? 1));
+    child.on('exit', (code, signal) => {
+      if (signal) observedSignal = signal;
+      resolve(code ?? signalExitCode(signal));
+    });
     child.on('error', () => resolve(1));
   });
   const stdout = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
@@ -221,6 +242,7 @@ const spawnDefaultLiveProcess = (
     kill() {
       child.kill();
     },
+    exitSignal: () => observedSignal,
   };
 };
 
@@ -238,8 +260,9 @@ const recordProcess = (
   const liveEnv = config.transformLiveEnv
     ? config.transformLiveEnv(spawnOptions.env)
     : spawnOptions.env;
-  const spawnImpl = config.spawnImpl ?? spawnDefaultLiveProcess;
-  const child = spawnImpl(argv, { cwd: spawnOptions.cwd, env: liveEnv });
+  const child: InternalLiveProcess = config.spawnImpl
+    ? config.spawnImpl(argv, { cwd: spawnOptions.cwd, env: liveEnv })
+    : spawnDefaultLiveProcess(argv, { cwd: spawnOptions.cwd, env: liveEnv });
 
   const context: ScrubContext = { cwd: spawnOptions.cwd };
   const transcript: ProcessTranscript = {
@@ -255,6 +278,15 @@ const recordProcess = (
   let events = 0;
   let killed = false;
   const rawFrames: ProcessFrame[] = [];
+
+  // Persistent streaming decoder + line buffer for stdin chunking (H12).
+  const stdinDecoder = new TextDecoder();
+  let stdinBuffer = '';
+  const recordStdinLine = (line: string): void => {
+    if (!line) return;
+    transcript.stdin.push(recorder.scrubber.scrubLine(line, context));
+    events++;
+  };
 
   const teeStream = (source: ReadableStream<Uint8Array>, stream: 'stdout' | 'stderr') => {
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -305,28 +337,47 @@ const recordProcess = (
 
   const exited = child.exited.then((code) => {
     onExit();
-    transcript.exit = { after: events, code: killed ? null : code, killed };
+    const signal = child.exitSignal?.();
+    transcript.exit = {
+      after: events,
+      code: killed ? null : code,
+      killed,
+      ...(signal ? { signal } : {}),
+    };
     return code;
   });
 
-  recorder.trackPendingWrite(
-    Promise.all([exited, stdout.done, stderr.done]).then(([code]) => {
-      const durationMs = Date.now() - started;
-      const filteredFrames = config.sanitizeFrames
-        ? config.sanitizeFrames(rawFrames).map((frame) => ({ ...frame, kept: true as const }))
-        : rawFrames;
-      transcript.frames = filteredFrames.map((frame) => ({
-        ...frame,
-        data: recorder.scrubber.scrubLine(frame.data, context),
-      }));
-      const model = typeof config.model === 'function' ? config.model(transcript) : config.model;
-      return recorder.storeCassette(
-        cassettePath,
-        { transport: 'process', status: killed ? 0 : code, body: transcript },
-        { transport: 'process', durationMs, ...(model ? { model } : {}) },
-      );
-    }),
-  );
+  const saveWork = Promise.all([exited, stdout.done, stderr.done]).then(([code]) => {
+    const durationMs = Date.now() - started;
+    const filteredFrames = config.sanitizeFrames
+      ? config.sanitizeFrames(rawFrames).map((frame) => ({ ...frame, kept: true as const }))
+      : rawFrames;
+    transcript.frames = filteredFrames.map((frame) => ({
+      ...frame,
+      data: recorder.scrubber.scrubLine(frame.data, context),
+    }));
+    const model = typeof config.model === 'function' ? config.model(transcript) : config.model;
+    return recorder.storeCassette(
+      cassettePath,
+      { transport: 'process', status: killed ? 0 : code, body: transcript },
+      { transport: 'process', durationMs, ...(model ? { model } : {}) },
+    );
+  });
+
+  recorder.trackPendingWrite(saveWork);
+
+  if (config.recordOnce) {
+    const ready = saveWork.then(
+      () => undefined,
+      () => undefined,
+    );
+    recorder.session.inFlightRecordOnce.set(cassettePath, ready);
+    void ready.finally(() => {
+      if (recorder.session.inFlightRecordOnce.get(cassettePath) === ready) {
+        recorder.session.inFlightRecordOnce.delete(cassettePath);
+      }
+    });
+  }
 
   return {
     stdout: stdout.readable,
@@ -334,10 +385,13 @@ const recordProcess = (
     exited,
     stdin: {
       write(data) {
-        const value = decodeChunk(data);
-        onWrite(value);
-        transcript.stdin.push(recorder.scrubber.scrubLine(value, context));
-        events++;
+        const decoded =
+          typeof data === 'string' ? data : stdinDecoder.decode(data, { stream: true });
+        onWrite(decoded);
+        stdinBuffer += decoded;
+        const lines = stdinBuffer.split('\n');
+        stdinBuffer = lines.pop() ?? '';
+        for (const line of lines) recordStdinLine(line);
         child.stdin.write(data);
       },
       flush() {
@@ -345,6 +399,11 @@ const recordProcess = (
       },
       end() {
         if (!transcript.stdinEnded) {
+          stdinBuffer += stdinDecoder.decode();
+          if (stdinBuffer.length > 0) {
+            recordStdinLine(stdinBuffer);
+            stdinBuffer = '';
+          }
           transcript.stdinEnded = true;
           events++;
         }
@@ -402,6 +461,9 @@ const replayProcess = (
   let stdinLineIndex = 0;
   let stdinEnded = false;
 
+  const stdinDecoder = new TextDecoder();
+  let stdinBuffer = '';
+
   const closeProcess = (code: number): void => {
     if (closed) return;
     closed = true;
@@ -451,6 +513,23 @@ const replayProcess = (
     );
   };
 
+  const consumeReplayStdinLine = (line: string): void => {
+    if (!line) return;
+    const recorded = recordedStdinLines[stdinLineIndex++];
+    if (recorded === undefined) {
+      failMismatch(`stdin line ${stdinLineIndex} was not recorded`);
+    }
+    const scrubbedIncoming = recorder.scrubber.scrubLine(line, context);
+    if (
+      protocolSession.comparableStdinLine(scrubbedIncoming) !==
+      protocolSession.comparableStdinLine(recorded)
+    ) {
+      failMismatch(`stdin line ${stdinLineIndex} differs from the recording`);
+    }
+    protocolSession.observeStdinPair(recorded, line);
+    events++;
+  };
+
   releaseDueFrames();
 
   return {
@@ -460,28 +539,23 @@ const replayProcess = (
     stdin: {
       write(data) {
         if (closed) failMismatch('write after process exit');
-        const value = decodeChunk(data);
-        onWrite(value);
-        for (const line of value.split('\n').filter(Boolean)) {
-          const recorded = recordedStdinLines[stdinLineIndex++];
-          if (recorded === undefined) {
-            failMismatch(`stdin line ${stdinLineIndex} was not recorded`);
-          }
-          const scrubbedIncoming = recorder.scrubber.scrubLine(line, context);
-          if (
-            protocolSession.comparableStdinLine(scrubbedIncoming) !==
-            protocolSession.comparableStdinLine(recorded)
-          ) {
-            failMismatch(`stdin line ${stdinLineIndex} differs from the recording`);
-          }
-          protocolSession.observeStdinPair(recorded, line);
-        }
-        events++;
+        const decoded =
+          typeof data === 'string' ? data : stdinDecoder.decode(data, { stream: true });
+        onWrite(decoded);
+        stdinBuffer += decoded;
+        const lines = stdinBuffer.split('\n');
+        stdinBuffer = lines.pop() ?? '';
+        for (const line of lines) consumeReplayStdinLine(line);
         releaseDueFrames();
       },
       flush() {},
       end() {
         if (stdinEnded) return;
+        stdinBuffer += stdinDecoder.decode();
+        if (stdinBuffer.length > 0) {
+          consumeReplayStdinLine(stdinBuffer);
+          stdinBuffer = '';
+        }
         if (stdinLineIndex < recordedStdinLines.length) {
           failMismatch(
             `stdin ended after ${stdinLineIndex} of ${recordedStdinLines.length} recorded lines`,
@@ -494,6 +568,83 @@ const replayProcess = (
     },
     kill() {
       closeProcess(transcript.exit.killed ? (transcript.exit.code ?? 143) : 143);
+    },
+  };
+};
+
+/** Defers replay until an in-flight `recordOnce` recording of the same cassette finishes (M6). */
+const replayAfterInFlight = (
+  ready: Promise<void>,
+  recorder: VcrRecorder,
+  cassettePath: string,
+  spawnOptions: ProcessSpawnOptions,
+  config: ProcessCassetteOptions,
+  onWrite: (data: string) => void,
+  onExit: () => void,
+): RecordedProcess => {
+  const bufferedOps: Array<
+    | { readonly kind: 'write'; readonly data: string | Uint8Array }
+    | { readonly kind: 'end' }
+    | { readonly kind: 'kill' }
+  > = [];
+  let delegate: RecordedProcess | undefined;
+
+  const pipeInto = (
+    sourcePromise: Promise<ReadableStream<Uint8Array>>,
+  ): ReadableStream<Uint8Array> =>
+    new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          const stream = await sourcePromise;
+          for await (const chunk of stream) {
+            controller.enqueue(chunk);
+          }
+          controller.close();
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+    });
+
+  const resolvedDelegate = ready.then(() => {
+    const proc = replayProcess(
+      recorder,
+      cassettePath,
+      recorder.fetchCassette<unknown, ProcessTranscript>(cassettePath),
+      spawnOptions,
+      config,
+      onWrite,
+      onExit,
+    );
+    delegate = proc;
+    for (const op of bufferedOps.splice(0)) {
+      if (op.kind === 'write') proc.stdin.write(op.data);
+      else if (op.kind === 'end') proc.stdin.end();
+      else proc.kill();
+    }
+    return proc;
+  });
+
+  return {
+    stdout: pipeInto(resolvedDelegate.then((p) => p.stdout)),
+    stderr: pipeInto(resolvedDelegate.then((p) => p.stderr)),
+    exited: resolvedDelegate.then((p) => p.exited),
+    stdin: {
+      write(data) {
+        if (delegate) delegate.stdin.write(data);
+        else bufferedOps.push({ kind: 'write', data });
+      },
+      flush() {
+        delegate?.stdin.flush();
+      },
+      end() {
+        if (delegate) delegate.stdin.end();
+        else bufferedOps.push({ kind: 'end' });
+      },
+    },
+    kill() {
+      if (delegate) delegate.kill();
+      else bufferedOps.push({ kind: 'kill' });
     },
   };
 };
@@ -537,6 +688,21 @@ export const createVcrProcessSpawner = (
           onWrite,
           onExit,
         );
+      }
+
+      if (options.recordOnce) {
+        const inFlight = recorder.session.inFlightRecordOnce.get(cassettePath);
+        if (inFlight) {
+          return replayAfterInFlight(
+            inFlight,
+            recorder,
+            cassettePath,
+            spawnOptions,
+            options,
+            onWrite,
+            onExit,
+          );
+        }
       }
 
       return recordProcess(

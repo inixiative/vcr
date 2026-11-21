@@ -1,14 +1,25 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, extname, join, relative } from 'node:path';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { basename, dirname, join, relative } from 'node:path';
 import {
   type CassetteSignature,
   compareSignatures,
   type SignatureOptions,
   signatureOfCassette,
 } from '../freshness/signature';
-import { createScrubber } from '../scrub/scrubber';
-import type { Scrubber, ScrubOptions } from '../scrub/types';
-import { VcrError } from './errors';
+import { resolveScrubber } from '../scrub/scrubber';
+import type { Scrubber } from '../scrub/types';
+import { isVcrError, VcrError } from './errors';
+import {
+  assertPathWithin,
+  assertSafeBinaryExtension,
+  assertSafePathSegment,
+  cassettePayloadForSignature,
+  PENDING_CASSETTE_SUFFIX,
+  readCassetteBody,
+  sidecarNameForCassette,
+  toPendingCassettePath,
+  writeFileAtomic,
+} from './fs-utils';
 import { defaultVcrSession, resolveVcrMode } from './session';
 import type {
   DriftFinding,
@@ -24,12 +35,8 @@ import type {
   VcrVersionResolver,
 } from './types';
 
-const isScrubberHandle = (value: Scrubber | ScrubOptions | undefined): value is Scrubber =>
-  Boolean(value && typeof value === 'object' && 'scrubText' in value && 'assertScrubbed' in value);
-
-const writeCassetteJson = (filePath: string, data: unknown): void => {
-  mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`);
+const writeCassetteJsonAtomic = (filePath: string, data: unknown): void => {
+  writeFileAtomic(filePath, `${JSON.stringify(data, null, 2)}\n`);
 };
 
 const maskValuesAtKeyPaths = <T>(data: T, keys: readonly string[]): T => {
@@ -64,10 +71,20 @@ const maskKeyPath = (node: unknown, parts: readonly string[]): void => {
 const signatureForCassette = (
   cassette: Pick<VcrCassette, 'status' | 'body' | 'entries'>,
   options?: SignatureOptions,
-): CassetteSignature => {
-  const payload = cassette.entries !== undefined ? { entries: cassette.entries } : cassette.body;
-  return signatureOfCassette(cassette.status, payload, options);
-};
+): CassetteSignature =>
+  signatureOfCassette(cassette.status, cassettePayloadForSignature(cassette), options);
+
+interface UndriftedSidecarRecord {
+  readonly committedPath: string;
+  readonly extension: string;
+  readonly previousBytes: Uint8Array | undefined;
+}
+
+interface UndriftedWriteRecord {
+  readonly target: string;
+  readonly previous: string | undefined;
+  readonly sidecar?: UndriftedSidecarRecord;
+}
 
 export class VcrRecorder {
   readonly service: string;
@@ -82,6 +99,7 @@ export class VcrRecorder {
   private readonly modeEnvVar?: string;
   private readonly environment?: string;
   private readonly outputDir?: string;
+  private readonly outputSubdir?: string;
   private readonly versionResolver: VcrVersionResolver;
   private readonly sanitizers: Readonly<Record<string, VcrMethodSanitizer>>;
   private readonly signatureOptions?: SignatureOptions;
@@ -90,12 +108,11 @@ export class VcrRecorder {
   private readonly onDrift?: (finding: DriftFinding) => void;
 
   private readonly queues = new Map<string, string[]>();
-  private readonly pendingWrites = new Set<Promise<unknown>>();
+  private readonly inFlightSaves = new Set<Promise<void>>();
+  private readonly pendingWrites = new Set<Promise<void>>();
+  private readonly pendingWriteErrors: unknown[] = [];
   private drifted = false;
-  private readonly undriftedWrites = new Map<
-    string,
-    { readonly target: string; readonly previous: string | undefined }
-  >();
+  private readonly undriftedWrites = new Map<string, UndriftedWriteRecord>();
 
   constructor(fixturesDir: string, options: VcrRecorderOptions) {
     this.fixturesDir = fixturesDir;
@@ -105,6 +122,7 @@ export class VcrRecorder {
     this.modeEnvVar = options.modeEnvVar;
     this.environment = options.environment;
     this.outputDir = options.outputDir;
+    this.outputSubdir = options.outputSubdir;
     this.cli = options.cli;
     this.model = options.model;
     this.metadata = options.metadata;
@@ -114,9 +132,7 @@ export class VcrRecorder {
     this.throwOnDrift = options.throwOnDrift ?? false;
     this.onDrift = options.onDrift;
     this.session = options.session ?? defaultVcrSession;
-    this.scrubber = isScrubberHandle(options.scrubber)
-      ? options.scrubber
-      : createScrubber(options.scrubber);
+    this.scrubber = resolveScrubber(options.scrubber);
   }
 
   get mode(): VcrMode {
@@ -124,6 +140,8 @@ export class VcrRecorder {
   }
 
   queue(method: string, cassetteName: string): this {
+    assertSafePathSegment(method, 'method');
+    assertSafePathSegment(cassetteName, 'cassetteName');
     const queue = this.queues.get(method) ?? [];
     queue.push(cassetteName);
     this.queues.set(method, queue);
@@ -136,6 +154,7 @@ export class VcrRecorder {
   }
 
   popCassettePath(method: string): string {
+    assertSafePathSegment(method, 'method');
     const queue = this.queues.get(method);
     const cassetteName = queue?.shift();
     if (!cassetteName) {
@@ -143,7 +162,11 @@ export class VcrRecorder {
         details: { method, service: this.service },
       });
     }
-    return join(this.fixturesDir, `${method}.${cassetteName}.json`);
+    assertSafePathSegment(cassetteName, 'cassetteName');
+    return assertPathWithin(
+      this.fixturesDir,
+      join(this.fixturesDir, `${method}.${cassetteName}.json`),
+    );
   }
 
   shouldReplay(cassettePath: string, recordOnce = false): boolean {
@@ -214,35 +237,29 @@ export class VcrRecorder {
     const cassettePath = this.popCassettePath(method);
     if (this.shouldReplay(cassettePath)) {
       const saved = this.fetchCassette<unknown, T>(cassettePath);
+      const resolvedPath = this.session.written.get(cassettePath) ?? cassettePath;
       if (saved.status >= 400) {
         throw new Error(typeof saved.body === 'string' ? saved.body : JSON.stringify(saved.body));
       }
-      if (saved.bodyFile) {
-        const resolvedPath = this.session.written.get(cassettePath) ?? cassettePath;
-        return readFileSync(join(dirname(resolvedPath), saved.bodyFile)) as unknown as T;
-      }
-      return saved.body as T;
+      return readCassetteBody(saved, resolvedPath);
     }
 
     this.session.spendLiveCall(`${this.service} ${method}`);
     const started = Date.now();
+    let rawResult: T;
     try {
-      const sanitized = this.sanitizeMethodPayload(method, await executeLive());
-      await this.persistPayload(cassettePath, method, sanitized, 200, undefined, {
-        durationMs: Date.now() - started,
-      });
-      return sanitized;
+      rawResult = await executeLive();
     } catch (error) {
-      const message = this.scrubber.scrubText(
-        error instanceof Error ? error.message : String(error),
-      );
-      await this.storeCassette(
-        cassettePath,
-        { transport: 'capture', status: 500, body: message },
-        { durationMs: Date.now() - started },
-      );
+      if (isVcrError(error)) throw error;
+      await this.recordLiveError(cassettePath, error, started);
       throw error;
     }
+
+    const sanitized = this.sanitizeMethodPayload(method, rawResult);
+    await this.persistPayload(cassettePath, method, sanitized, 200, undefined, {
+      durationMs: Date.now() - started,
+    });
+    return sanitized;
   }
 
   async captureResponse<T>(
@@ -253,9 +270,7 @@ export class VcrRecorder {
     if (this.shouldReplay(cassettePath)) {
       const saved = this.fetchCassette<unknown, T>(cassettePath);
       const resolvedPath = this.session.written.get(cassettePath) ?? cassettePath;
-      const body = saved.bodyFile
-        ? (readFileSync(join(dirname(resolvedPath), saved.bodyFile)) as unknown as T)
-        : (saved.body as T);
+      const body = readCassetteBody(saved, resolvedPath);
       return {
         status: saved.status,
         body,
@@ -265,29 +280,25 @@ export class VcrRecorder {
 
     this.session.spendLiveCall(`${this.service} ${method}`);
     const started = Date.now();
+    let live: VcrResponse<T>;
     try {
-      const live = await executeLive();
-      const sanitizedBody = this.sanitizeMethodPayload(method, live.body);
-      const scrubbedHeaders = live.headers ? this.scrubber.scrubHeaders(live.headers) : undefined;
-      await this.persistPayload(cassettePath, method, sanitizedBody, live.status, scrubbedHeaders, {
-        durationMs: Date.now() - started,
-      });
-      return {
-        status: live.status,
-        body: sanitizedBody,
-        ...(scrubbedHeaders ? { headers: scrubbedHeaders } : {}),
-      };
+      live = await executeLive();
     } catch (error) {
-      const message = this.scrubber.scrubText(
-        error instanceof Error ? error.message : String(error),
-      );
-      await this.storeCassette(
-        cassettePath,
-        { transport: 'capture', status: 500, body: message },
-        { durationMs: Date.now() - started },
-      );
+      if (isVcrError(error)) throw error;
+      await this.recordLiveError(cassettePath, error, started);
       throw error;
     }
+
+    const sanitizedBody = this.sanitizeMethodPayload(method, live.body);
+    const scrubbedHeaders = live.headers ? this.scrubber.scrubHeaders(live.headers) : undefined;
+    await this.persistPayload(cassettePath, method, sanitizedBody, live.status, scrubbedHeaders, {
+      durationMs: Date.now() - started,
+    });
+    return {
+      status: live.status,
+      body: sanitizedBody,
+      ...(scrubbedHeaders ? { headers: scrubbedHeaders } : {}),
+    };
   }
 
   async execute<TRequest, TResponse>(
@@ -325,9 +336,7 @@ export class VcrRecorder {
       }
 
       const resolvedPath = this.session.written.get(cassettePath) ?? cassettePath;
-      const body = saved.bodyFile
-        ? (readFileSync(join(dirname(resolvedPath), saved.bodyFile)) as unknown as TResponse)
-        : (saved.body as TResponse);
+      const body = readCassetteBody(saved, resolvedPath);
       return {
         status: saved.status,
         body,
@@ -350,7 +359,14 @@ export class VcrRecorder {
         key: incomingKey,
         request: scrubbedRequest,
         status: live.status,
-        body: scrubbedBody,
+        ...(scrubbedBody instanceof Uint8Array
+          ? {
+              binarySidecar: {
+                data: scrubbedBody,
+                extension: this.sanitizers[method]?.binaryExtension ?? '.bin',
+              },
+            }
+          : { body: scrubbedBody }),
         ...(scrubbedHeaders ? { headers: scrubbedHeaders } : {}),
       },
       {
@@ -377,13 +393,14 @@ export class VcrRecorder {
     return scrubbed;
   }
 
-  /** Stamps, asserts secret-safety, checks drift, and writes a cassette to disk. */
+  /** Stamps, asserts secret-safety, checks drift, and atomically writes a cassette (and any binary sidecar) to disk. */
   storeCassette<TRequest = unknown, TResponse = unknown>(
     cassettePath: string,
     cassette: StoreCassetteInput<TRequest, TResponse>,
     stampExtra: Partial<VcrRecordingStamp> = {},
   ): Promise<string> {
     const saving = (async () => {
+      assertPathWithin(this.fixturesDir, cassettePath);
       const version = await this.fetchServiceVersion();
       const mergedMetadata =
         this.metadata || stampExtra.metadata
@@ -399,24 +416,51 @@ export class VcrRecorder {
         ...stampExtra,
         ...(mergedMetadata ? { metadata: mergedMetadata } : {}),
       };
-      const next: VcrCassette<TRequest, TResponse> = {
+
+      const { binarySidecar, ...cassetteFields } = cassette;
+      const preview: VcrCassette<TRequest, TResponse> = {
         version,
-        ...cassette,
+        ...cassetteFields,
+        ...(binarySidecar
+          ? { bodyFile: sidecarNameForCassette(cassettePath, binarySidecar.extension) }
+          : {}),
         recorded,
       };
 
       if (this.verifyScrubbed) {
-        this.scrubber.assertScrubbed(next, basename(cassettePath));
+        this.scrubber.assertScrubbed(preview, basename(cassettePath));
       }
 
-      const { target, driftFinding } = this.resolveTargetPath(cassettePath, next);
+      const { target, targetRoot, driftFinding } = this.resolveTargetPath(cassettePath, preview);
+
+      let sidecarRecord: UndriftedSidecarRecord | undefined;
+      let finalCassette: VcrCassette<TRequest, TResponse> = preview;
+      if (binarySidecar) {
+        const safeExt = assertSafeBinaryExtension(binarySidecar.extension);
+        const sidecarName = sidecarNameForCassette(target, safeExt);
+        const sidecarPath = assertPathWithin(targetRoot, join(dirname(target), sidecarName));
+        finalCassette = {
+          ...preview,
+          bodyFile: sidecarName,
+        };
+        if (!this.drifted && !this.undriftedWrites.has(cassettePath)) {
+          sidecarRecord = {
+            committedPath: sidecarPath,
+            extension: safeExt,
+            previousBytes: existsSync(sidecarPath) ? readFileSync(sidecarPath) : undefined,
+          };
+        }
+        writeFileAtomic(sidecarPath, binarySidecar.data);
+      }
+
       if (!this.drifted && !this.undriftedWrites.has(cassettePath)) {
         this.undriftedWrites.set(cassettePath, {
           target,
           previous: existsSync(target) ? readFileSync(target, 'utf8') : undefined,
+          ...(sidecarRecord ? { sidecar: sidecarRecord } : {}),
         });
       }
-      writeCassetteJson(target, next);
+      writeCassetteJsonAtomic(target, finalCassette);
       this.session.written.set(cassettePath, target);
 
       if (driftFinding && this.throwOnDrift) {
@@ -428,21 +472,42 @@ export class VcrRecorder {
       }
       return target;
     })();
-    this.trackPendingWrite(saving);
+
+    const settled = saving.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.inFlightSaves.add(settled);
+    void settled.finally(() => {
+      this.inFlightSaves.delete(settled);
+    });
     return saving;
   }
 
-  /** Tracks an asynchronous cassette write so `waitUntilSettled()` awaits completion. */
+  /** Tracks an asynchronous background recording so `waitUntilSettled()` awaits it and rethrows any failure. */
   trackPendingWrite<T>(work: Promise<T>): Promise<T> {
-    this.pendingWrites.add(work);
-    void work.finally(() => this.pendingWrites.delete(work)).catch(() => {});
+    const tracked = work.then(
+      () => undefined,
+      (error: unknown) => {
+        this.pendingWriteErrors.push(error);
+      },
+    );
+    this.pendingWrites.add(tracked);
+    void tracked.finally(() => {
+      this.pendingWrites.delete(tracked);
+    });
     return work;
   }
 
-  /** Resolves once every tracked recording started on this recorder has finished writing. */
+  /** Resolves once every tracked recording started on this recorder has finished writing; rethrows any background write failures. */
   async waitUntilSettled(): Promise<void> {
-    while (this.pendingWrites.size > 0) {
-      await Promise.allSettled([...this.pendingWrites]);
+    while (this.pendingWrites.size > 0 || this.inFlightSaves.size > 0) {
+      await Promise.all([...this.pendingWrites, ...this.inFlightSaves]);
+    }
+    if (this.pendingWriteErrors.length > 0) {
+      const errors = this.pendingWriteErrors.splice(0);
+      if (errors.length === 1) throw errors[0];
+      throw new AggregateError(errors, `VCR: ${errors.length} background cassette writes failed`);
     }
   }
 
@@ -457,17 +522,50 @@ export class VcrRecorder {
     this.queues.clear();
   }
 
+  private async recordLiveError(
+    cassettePath: string,
+    error: unknown,
+    started: number,
+  ): Promise<void> {
+    const message = this.scrubber.scrubText(error instanceof Error ? error.message : String(error));
+    await this.storeCassette(
+      cassettePath,
+      { transport: 'capture', status: 500, body: message },
+      { durationMs: Date.now() - started },
+    );
+  }
+
+  private resolveOutputRoot(): string {
+    if (this.outputDir) {
+      if (this.outputSubdir) {
+        assertSafePathSegment(this.outputSubdir, 'outputSubdir');
+        return assertPathWithin(this.outputDir, join(this.outputDir, this.outputSubdir));
+      }
+      return this.outputDir;
+    }
+    const envOut = process.env.VCR_OUT;
+    if (envOut) {
+      const subdir = this.outputSubdir ?? this.service;
+      assertSafePathSegment(subdir, 'outputSubdir');
+      return assertPathWithin(envOut, join(envOut, subdir));
+    }
+    return this.fixturesDir;
+  }
+
   private resolveTargetPath(
     cassettePath: string,
     next: VcrCassette,
-  ): { readonly target: string; readonly driftFinding?: DriftFinding } {
-    const outputRoot = this.outputDir ?? process.env.VCR_OUT;
-    const out = outputRoot
-      ? join(outputRoot, relative(this.fixturesDir, cassettePath))
-      : cassettePath;
-    const pendingPath = out.replace(/\.json$/, '.pending.json');
-    if (this.drifted) return { target: pendingPath };
-    if (!existsSync(cassettePath)) return { target: out };
+  ): {
+    readonly target: string;
+    readonly targetRoot: string;
+    readonly driftFinding?: DriftFinding;
+  } {
+    const targetRoot = this.resolveOutputRoot();
+    const relFromFixtures = relative(this.fixturesDir, cassettePath);
+    const out = assertPathWithin(targetRoot, join(targetRoot, relFromFixtures));
+    const pendingPath = assertPathWithin(targetRoot, toPendingCassettePath(out));
+    if (this.drifted) return { target: pendingPath, targetRoot };
+    if (!existsSync(cassettePath)) return { target: out, targetRoot };
 
     const committed = JSON.parse(readFileSync(cassettePath, 'utf8')) as VcrCassette;
     const differences = compareSignatures(
@@ -475,24 +573,52 @@ export class VcrRecorder {
       signatureForCassette(next, this.signatureOptions),
       this.signatureOptions,
     );
-    if (differences.length === 0) return { target: out };
+    if (differences.length === 0) return { target: out, targetRoot };
 
     this.drifted = true;
     this.holdBackUndriftedWrites();
     const finding: DriftFinding = { cassette: cassettePath, pending: pendingPath, differences };
     this.session.drift.push(finding);
     this.onDrift?.(finding);
-    return { target: pendingPath, driftFinding: finding };
+    return { target: pendingPath, targetRoot, driftFinding: finding };
   }
 
   // why: all cassettes from one test run must come from the same live run, so earlier writes move to pending too.
   private holdBackUndriftedWrites(): void {
-    for (const [cassettePath, { target, previous }] of this.undriftedWrites) {
-      if (!existsSync(target)) continue;
-      const pending = target.replace(/\.json$/, '.pending.json');
-      writeFileSync(pending, readFileSync(target, 'utf8'));
-      if (previous === undefined) rmSync(target);
-      else writeFileSync(target, previous);
+    for (const [cassettePath, { target, previous, sidecar }] of this.undriftedWrites) {
+      if (
+        !existsSync(target) ||
+        !target.endsWith('.json') ||
+        target.endsWith(PENDING_CASSETTE_SUFFIX)
+      ) {
+        continue;
+      }
+      const pending = toPendingCassettePath(target);
+      let pendingContent = readFileSync(target, 'utf8');
+
+      if (sidecar && existsSync(sidecar.committedPath)) {
+        const pendingSidecarName = sidecarNameForCassette(pending, sidecar.extension);
+        const pendingSidecarPath = assertPathWithin(
+          dirname(pending),
+          join(dirname(pending), pendingSidecarName),
+        );
+        writeFileAtomic(pendingSidecarPath, readFileSync(sidecar.committedPath));
+        if (sidecar.previousBytes === undefined) {
+          rmSync(sidecar.committedPath, { force: true });
+        } else {
+          writeFileAtomic(sidecar.committedPath, sidecar.previousBytes);
+        }
+        try {
+          const parsed = JSON.parse(pendingContent) as VcrCassette;
+          pendingContent = `${JSON.stringify({ ...parsed, bodyFile: pendingSidecarName }, null, 2)}\n`;
+        } catch {
+          /* Keep raw JSON if parsing unexpectedly fails. */
+        }
+      }
+
+      writeFileAtomic(pending, pendingContent);
+      if (previous === undefined) rmSync(target, { force: true });
+      else writeFileAtomic(target, previous);
       this.session.written.set(cassettePath, pending);
     }
     this.undriftedWrites.clear();
@@ -507,22 +633,17 @@ export class VcrRecorder {
     stampExtra?: Partial<VcrRecordingStamp>,
   ): Promise<void> {
     if (body instanceof Uint8Array) {
-      const ext = this.sanitizers[method]?.binaryExtension ?? '.bin';
-      const baseName = basename(cassettePath, extname(cassettePath));
-      const sidecarName = `${baseName}${ext}`;
-      const targetPath = await this.storeCassette(
+      const ext = assertSafeBinaryExtension(this.sanitizers[method]?.binaryExtension ?? '.bin');
+      await this.storeCassette(
         cassettePath,
         {
           transport: 'capture',
           status,
-          bodyFile: sidecarName,
+          binarySidecar: { data: body, extension: ext },
           ...(headers ? { headers } : {}),
         },
         stampExtra,
       );
-      const sidecarPath = join(dirname(targetPath), sidecarName);
-      mkdirSync(dirname(sidecarPath), { recursive: true });
-      writeFileSync(sidecarPath, body);
       return;
     }
 

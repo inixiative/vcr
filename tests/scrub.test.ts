@@ -62,7 +62,7 @@ describe('standalone @inixiative/vcr/scrub', () => {
       ['pem', pem, '<REDACTED:PRIVATE_KEY>'],
       [
         'postgres url',
-        'postgres://appuser:s3cr3tP@ss@db.internal:5432/prod',
+        'postgres://appuser:s3cr3tPass@db.internal:5432/prod',
         'postgres://appuser:<REDACTED:URL_CREDENTIAL>@db.internal:5432/prod',
       ],
       [

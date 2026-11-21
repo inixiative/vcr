@@ -10,6 +10,7 @@ export {
 } from './session';
 export { defineVcrTransport } from './transport';
 export {
+  type BinarySidecarInput,
   DEFAULT_MAX_LIVE_CALLS,
   DEFAULT_MODE_ENV_VAR,
   type DriftFinding,

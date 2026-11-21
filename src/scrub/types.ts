@@ -46,6 +46,8 @@ export interface ScrubOptions {
   readonly context?: ScrubContext;
   /** Exact literal secrets scrubbed BEFORE regex rules so malformed or non-standard secrets never leak. */
   readonly knownSecrets?: readonly string[];
+  /** Minimum trimmed length for entries in `knownSecrets` to prevent accidental single-char corruption. Defaults to 4. */
+  readonly minKnownSecretLength?: number;
   /** Custom domain-specific scrub rules applied after knownSecrets and built-in detectors. */
   readonly rules?: readonly ScrubRule[];
   /** Custom deterministic placeholder resolver. */

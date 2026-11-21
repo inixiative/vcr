@@ -208,11 +208,13 @@ describe('WebSocket transport (live 127.0.0.1:0 loopback)', () => {
       }).queueMany('ws', ['handshake', 'handshake']);
       const wsFactory = createVcrWebSocketFactory(replayer, 'ws');
 
-      const replayedReceived = await runSession(wsFactory('ws://unused.invalid/stream'));
+      const replayedReceived = await runSession(
+        wsFactory('ws://unused.invalid/stream?token=replay'),
+      );
       expect(replayedReceived.map((m) => m.type)).toEqual(['welcome', 'pong']);
 
       // Sending a different message fails with VcrError('request_mismatch').
-      const mismatchSocket = wsFactory('ws://unused.invalid/stream');
+      const mismatchSocket = wsFactory('ws://unused.invalid/stream?token=replay');
       await new Promise<void>((resolve) => {
         mismatchSocket.onopen = () => resolve();
       });

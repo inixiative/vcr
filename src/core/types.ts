@@ -102,6 +102,8 @@ export interface VcrRecorderOptions {
   readonly environment?: string;
   /** Optional directory where recordings are written instead of `fixturesDir`. */
   readonly outputDir?: string;
+  /** Optional subdirectory under `outputDir` or `VCR_OUT` (defaults to `service` when `VCR_OUT` env fallback is used). */
+  readonly outputSubdir?: string;
   /** Optional CLI binary name stamped into recordings for freshness checks. */
   readonly cli?: string;
   /** Optional model identifier stamped into recordings. */
@@ -130,6 +132,11 @@ export interface ResolveModeOptions {
   readonly envVar?: string;
 }
 
+export interface BinarySidecarInput {
+  readonly data: Uint8Array;
+  readonly extension: string;
+}
+
 export interface StoreCassetteInput<TRequest = unknown, TResponse = unknown> {
   readonly transport?: string;
   readonly key?: string;
@@ -138,6 +145,7 @@ export interface StoreCassetteInput<TRequest = unknown, TResponse = unknown> {
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: TResponse | null;
   readonly bodyFile?: string;
+  readonly binarySidecar?: BinarySidecarInput;
   readonly entries?: readonly VcrEntry<TRequest, TResponse>[];
 }
 
@@ -145,6 +153,7 @@ export interface VcrSession {
   readonly versionCache: Map<string, string>;
   readonly drift: DriftFinding[];
   readonly written: Map<string, string>;
+  readonly inFlightRecordOnce: Map<string, Promise<void>>;
   liveCalls: number;
   maxLiveCalls: number;
   spendLiveCall(label: string): void;

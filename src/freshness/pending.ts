@@ -1,5 +1,23 @@
-import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
+import { VcrError } from '../core/errors';
+import {
+  assertPathWithin,
+  assertSafePathSegment,
+  cassettePayloadForSignature,
+  fromPendingCassettePath,
+  PENDING_CASSETTE_SUFFIX,
+  POLICY_FILENAME,
+  writeFileAtomic,
+} from '../core/fs-utils';
 import type { VcrCassette } from '../core/types';
 import {
   compareSignatures,
@@ -8,8 +26,7 @@ import {
   signatureOfCassette,
 } from './signature';
 
-export const PENDING_CASSETTE_SUFFIX = '.pending.json';
-export const POLICY_FILENAME = 'policy.json';
+export { PENDING_CASSETTE_SUFFIX, POLICY_FILENAME };
 
 export interface AcceptedDrift {
   readonly cassette: string;
@@ -22,7 +39,7 @@ export interface FetchCassettePathsOptions {
   readonly includePending?: boolean;
 }
 
-/** Lists all cassette JSON paths under `fixturesDir` (sorted), excluding `policy.json`. */
+/** Lists all cassette JSON paths under `fixturesDir` (sorted), excluding `policy.json`, rejecting escaping symlinks. */
 export const fetchCassettePaths = (
   fixturesDir: string,
   options: FetchCassettePathsOptions = {},
@@ -31,10 +48,27 @@ export const fetchCassettePaths = (
   const policyFile = join(fixturesDir, POLICY_FILENAME);
   const out: string[] = [];
 
+  if (!existsSync(fixturesDir)) return out;
+  const canonicalRoot = realpathSync(fixturesDir);
+
   const walk = (directory: string): void => {
     for (const name of readdirSync(directory)) {
       const fullPath = join(directory, name);
-      if (statSync(fullPath).isDirectory()) {
+      const stats = lstatSync(fullPath);
+      if (stats.isSymbolicLink()) {
+        let targetReal: string;
+        try {
+          targetReal = realpathSync(fullPath);
+        } catch (error) {
+          throw new VcrError('invalid_cassette', `VCR: broken symlink "${fullPath}"`, {
+            cassette: fullPath,
+            cause: error,
+          });
+        }
+        assertPathWithin(canonicalRoot, targetReal);
+        continue;
+      }
+      if (stats.isDirectory()) {
         walk(fullPath);
       } else if (name.endsWith('.json') && fullPath !== policyFile) {
         if (!includePending && name.endsWith(PENDING_CASSETTE_SUFFIX)) continue;
@@ -43,7 +77,7 @@ export const fetchCassettePaths = (
     }
   };
 
-  if (existsSync(fixturesDir)) walk(fixturesDir);
+  walk(fixturesDir);
   return out.sort();
 };
 
@@ -53,13 +87,20 @@ export const fetchPendingCassettes = (fixturesDir: string): string[] =>
     filePath.endsWith(PENDING_CASSETTE_SUFFIX),
   );
 
-const parseCassetteFile = (filePath: string): VcrCassette =>
-  JSON.parse(readFileSync(filePath, 'utf8')) as VcrCassette;
+const parseCassetteFile = (filePath: string): VcrCassette => {
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf8')) as VcrCassette;
+  } catch (error) {
+    throw new VcrError('invalid_cassette', `VCR: cassette "${filePath}" contains invalid JSON`, {
+      cassette: filePath,
+      cause: error,
+    });
+  }
+};
 
 const signatureOfFile = (filePath: string, options?: SignatureOptions) => {
   const cassette = parseCassetteFile(filePath);
-  const payload = cassette.entries !== undefined ? { entries: cassette.entries } : cassette.body;
-  return signatureOfCassette(cassette.status, payload, options);
+  return signatureOfCassette(cassette.status, cassettePayloadForSignature(cassette), options);
 };
 
 /** Returns structural differences between a committed cassette and a candidate recording file. */
@@ -84,33 +125,116 @@ export const diffVolatileCassetteNotices = (
 ): string[] => {
   const before = JSON.parse(beforeJson) as VcrCassette;
   const after = JSON.parse(afterJson) as VcrCassette;
-  const beforePayload = before.entries !== undefined ? { entries: before.entries } : before.body;
-  const afterPayload = after.entries !== undefined ? { entries: after.entries } : after.body;
   return compareVolatileSignatures(
-    signatureOfCassette(before.status, beforePayload, options),
-    signatureOfCassette(after.status, afterPayload, options),
+    signatureOfCassette(before.status, cassettePayloadForSignature(before), options),
+    signatureOfCassette(after.status, cassettePayloadForSignature(after), options),
     options,
   );
 };
 
-/** Promotes every `.pending.json` recording under `fixturesDir` to replace its committed cassette. */
+const promotedSidecarName = (bodyFile: string): string | undefined => {
+  const idx = bodyFile.lastIndexOf('.pending.');
+  if (idx === -1) return undefined;
+  return `${bodyFile.slice(0, idx)}.${bodyFile.slice(idx + '.pending.'.length)}`;
+};
+
+interface PlannedAcceptance {
+  readonly cassettePath: string;
+  readonly pendingPath: string;
+  readonly differences: readonly string[];
+  readonly pendingCassette: VcrCassette;
+  readonly pendingSidecarPath?: string;
+  readonly promotedSidecarPath?: string;
+  readonly promotedBodyFile?: string;
+}
+
+/** Atomically validates and promotes every `.pending.json` recording (and pending binary sidecar) under `fixturesDir`. */
 export const acceptPendingCassettes = (
   fixturesDir: string,
   options?: SignatureOptions,
 ): AcceptedDrift[] => {
-  const accepted: AcceptedDrift[] = [];
-  for (const pendingPath of fetchPendingCassettes(fixturesDir)) {
-    const cassettePath = pendingPath.replace(/\.pending\.json$/, '.json');
+  const pendingPaths = fetchPendingCassettes(fixturesDir);
+  const plan: PlannedAcceptance[] = [];
+
+  // Pass 1: parse, validate paths/sidecars, and compute all diffs before mutating disk.
+  for (const pendingPath of pendingPaths) {
+    const cassettePath = assertPathWithin(fixturesDir, fromPendingCassettePath(pendingPath));
+    const pendingCassette = parseCassetteFile(pendingPath);
     const differences = diffCassetteDrift(cassettePath, pendingPath, options);
-    renameSync(pendingPath, cassettePath);
-    accepted.push({ cassette: cassettePath, pending: pendingPath, differences });
+
+    let pendingSidecarPath: string | undefined;
+    let promotedSidecarPath: string | undefined;
+    let promotedBodyFile: string | undefined;
+    if (pendingCassette.bodyFile) {
+      assertSafePathSegment(pendingCassette.bodyFile, 'bodyFile');
+      const dir = dirname(pendingPath);
+      const nextName = promotedSidecarName(pendingCassette.bodyFile);
+      if (nextName) {
+        assertSafePathSegment(nextName, 'bodyFile');
+        pendingSidecarPath = assertPathWithin(dir, join(dir, pendingCassette.bodyFile));
+        if (!existsSync(pendingSidecarPath)) {
+          throw new VcrError(
+            'invalid_cassette',
+            `VCR: pending cassette "${pendingPath}" references missing binary sidecar "${pendingCassette.bodyFile}"`,
+            { cassette: pendingPath },
+          );
+        }
+        promotedSidecarPath = assertPathWithin(dir, join(dir, nextName));
+        promotedBodyFile = nextName;
+      }
+    }
+
+    plan.push({
+      cassettePath,
+      pendingPath,
+      differences,
+      pendingCassette,
+      pendingSidecarPath,
+      promotedSidecarPath,
+      promotedBodyFile,
+    });
   }
+
+  // Pass 2: promote sidecars and cassettes atomically.
+  const accepted: AcceptedDrift[] = [];
+  for (const item of plan) {
+    if (item.pendingSidecarPath && item.promotedSidecarPath && item.promotedBodyFile) {
+      renameSync(item.pendingSidecarPath, item.promotedSidecarPath);
+      const promoted: VcrCassette = {
+        ...item.pendingCassette,
+        bodyFile: item.promotedBodyFile,
+      };
+      writeFileAtomic(item.cassettePath, `${JSON.stringify(promoted, null, 2)}\n`);
+      rmSync(item.pendingPath, { force: true });
+    } else {
+      renameSync(item.pendingPath, item.cassettePath);
+    }
+    accepted.push({
+      cassette: item.cassettePath,
+      pending: item.pendingPath,
+      differences: item.differences,
+    });
+  }
+
   return accepted;
 };
 
-/** Deletes every `.pending.json` drift file under `fixturesDir` without touching committed cassettes. */
+/** Deletes every `.pending.json` drift file (and any associated pending binary sidecar) under `fixturesDir`. */
 export const discardPendingCassettes = (fixturesDir: string): string[] => {
   const pending = fetchPendingCassettes(fixturesDir);
-  for (const filePath of pending) rmSync(filePath, { force: true });
+  for (const filePath of pending) {
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as VcrCassette;
+      if (parsed.bodyFile && promotedSidecarName(parsed.bodyFile)) {
+        assertSafePathSegment(parsed.bodyFile, 'bodyFile');
+        const dir = dirname(filePath);
+        const sidecarPath = assertPathWithin(dir, join(dir, parsed.bodyFile));
+        rmSync(sidecarPath, { force: true });
+      }
+    } catch {
+      /* Invalid JSON pending file still gets discarded below. */
+    }
+    rmSync(filePath, { force: true });
+  }
   return pending;
 };

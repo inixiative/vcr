@@ -29,11 +29,26 @@ import type {
   ScrubRule,
 } from './types';
 
+const DEFAULT_MIN_KNOWN_SECRET_LENGTH = 4;
+const MAX_EMBEDDED_JSON_ATTEMPTS = 64;
+const MAX_EMBEDDED_JSON_SLICE_BYTES = 256 * 1024;
+const SECRET_KEY_REDACTED_SEGMENT = '<secret-key>';
+
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-const ensureGlobalFlags = (flags: string): string => (flags.includes('g') ? flags : `${flags}g`);
+const ensureGlobalFlags = (flags: string): string =>
+  flags.includes('g') ? flags.replace(/y/g, '') : `${flags.replace(/y/g, '')}g`;
 
-const stripGlobalFlag = (flags: string): string => flags.replace(/g/g, '');
+const stripStatefulFlags = (pattern: RegExp): RegExp =>
+  new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, ''));
+
+const safeDecodeURIComponent = (value: string): string => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
 
 const pathVariants = (path: string | undefined): string[] => {
   if (!path) return [];
@@ -102,22 +117,33 @@ const mergeContexts = (
   };
 };
 
-const normalizeKnownSecrets = (secrets: readonly string[] | undefined): string[] => {
-  if (!secrets?.length) return [];
+const buildKnownSecretsPattern = (
+  secrets: readonly string[] | undefined,
+  minLength: number,
+): RegExp | undefined => {
+  if (!secrets?.length) return undefined;
   const expanded = new Set<string>();
   for (const raw of secrets) {
     const trimmed = raw.trim();
-    if (!trimmed) continue;
+    if (trimmed.length < minLength) continue;
     expanded.add(raw);
+    if (trimmed !== raw) expanded.add(trimmed);
     const encoded = encodeURIComponent(raw);
     if (encoded !== raw) expanded.add(encoded);
+    const encodedTrimmed = encodeURIComponent(trimmed);
+    if (encodedTrimmed !== trimmed) expanded.add(encodedTrimmed);
   }
-  return [...expanded].sort((a, b) => b.length - a.length);
+  const sorted = [...expanded].sort((a, b) => b.length - a.length);
+  if (sorted.length === 0) return undefined;
+  return new RegExp(sorted.map(escapeRegExp).join('|'), 'g');
 };
 
 const buildQueryParamPattern = (paramNames: ReadonlySet<string>): RegExp => {
   const escaped = [...paramNames].map(escapeRegExp).sort((a, b) => b.length - a.length);
-  return new RegExp(`([?&](?:${escaped.join('|')})=)(?!<REDACTED:|REDACTED\\b)[^&#\\s"']+`, 'gi');
+  return new RegExp(
+    `([?&#](?:${escaped.join('|')})=)(?!<REDACTED:|REDACTED\\b)([^&#\\s"']+)`,
+    'gi',
+  );
 };
 
 const applyCustomRule = (text: string, rule: ScrubRule): string => {
@@ -129,64 +155,187 @@ const applyCustomRule = (text: string, rule: ScrubRule): string => {
       return fn(match, ...groups);
     });
   }
-  return text.replace(regex, rule.placeholder);
+  const literal = rule.placeholder;
+  return text.replace(regex, () => literal);
+};
+
+const ALL_PLACEHOLDER_KINDS: readonly ScrubPlaceholderKind[] = [
+  'secret',
+  'bearer',
+  'basic',
+  'dpop',
+  'fly_token',
+  'jwt',
+  'private_key',
+  'anthropic_key',
+  'openai_key',
+  'github_token',
+  'google_key',
+  'slack_token',
+  'slack_webhook',
+  'render_token',
+  'kingdom_token',
+  'aws_key',
+  'provider_token',
+  'api_token',
+  'url_credential',
+  'header_secret',
+  'key_secret',
+  'query_secret',
+  'email',
+  'ip',
+  'uuid',
+];
+
+const buildSafePlaceholderSet = (
+  placeholderFor: ScrubPlaceholderResolver,
+  extraSafeValues: ReadonlySet<string>,
+): Set<string> => {
+  const values = new Set<string>(extraSafeValues);
+  for (const kind of ALL_PLACEHOLDER_KINDS) {
+    const sample = placeholderFor(kind, '');
+    if (!sample) continue;
+    values.add(sample);
+    if (kind === 'bearer') values.add(`Bearer ${sample}`);
+    if (kind === 'basic') values.add(`Basic ${sample}`);
+    if (kind === 'dpop') values.add(`DPoP ${sample}`);
+    if (kind === 'fly_token') values.add(`FlyV1 ${sample}`);
+  }
+  return values;
 };
 
 const isSafePlaceholder = (
   value: string,
-  placeholderFor: ScrubPlaceholderResolver,
-  extraSafeValues: ReadonlySet<string>,
+  safeValues: ReadonlySet<string>,
+  safeLower: ReadonlySet<string>,
 ): boolean => {
   if (value === '') return true;
   if (SAFE_PLACEHOLDER_PATTERN.test(value)) return true;
-  if (extraSafeValues.has(value)) return true;
-  const customKinds: ScrubPlaceholderKind[] = [
-    'secret',
-    'bearer',
-    'basic',
-    'dpop',
-    'fly_token',
-    'jwt',
-    'private_key',
-    'anthropic_key',
-    'openai_key',
-    'github_token',
-    'google_key',
-    'slack_token',
-    'slack_webhook',
-    'render_token',
-    'kingdom_token',
-    'aws_key',
-    'provider_token',
-    'api_token',
-    'url_credential',
-    'header_secret',
-    'key_secret',
-    'query_secret',
-    'email',
-    'ip',
-    'uuid',
-  ];
-  for (const kind of customKinds) {
-    const sample = placeholderFor(kind, '');
-    if (value === sample) return true;
-    if (
-      (kind === 'bearer' && value.toLowerCase() === `bearer ${sample.toLowerCase()}`) ||
-      (kind === 'basic' && value.toLowerCase() === `basic ${sample.toLowerCase()}`) ||
-      (kind === 'dpop' && value.toLowerCase() === `dpop ${sample.toLowerCase()}`) ||
-      (kind === 'fly_token' && value.toLowerCase() === `flyv1 ${sample.toLowerCase()}`)
-    ) {
-      return true;
-    }
-  }
-  return false;
+  if (safeValues.has(value)) return true;
+  return safeLower.has(value.toLowerCase());
 };
 
-const formatPlaceholder = (
-  placeholderFor: ScrubPlaceholderResolver,
-  kind: ScrubPlaceholderKind,
-  match: string,
-): string => placeholderFor(kind, match);
+const collectSafeSpans = (
+  text: string,
+  safeValues: ReadonlySet<string>,
+): Array<readonly [number, number]> => {
+  const spans: Array<readonly [number, number]> = [];
+  for (const match of text.matchAll(/<REDACTED(?::[A-Z0-9_-]+)?>/gi)) {
+    const idx = match.index;
+    if (idx !== undefined) spans.push([idx, idx + match[0].length]);
+  }
+  for (const token of safeValues) {
+    if (!token || token.startsWith('<REDACTED')) continue;
+    let at = text.indexOf(token);
+    while (at !== -1) {
+      spans.push([at, at + token.length]);
+      at = text.indexOf(token, at + token.length);
+    }
+  }
+  return spans;
+};
+
+const isInsideSpans = (
+  start: number,
+  end: number,
+  spans: ReadonlyArray<readonly [number, number]>,
+): boolean => spans.some(([s, e]) => start >= s && end <= e);
+
+/** Linear scanner for `"key": "value"` and `\"key\": \"value\"` pairs inside arbitrary text. */
+const extractJsonStringPairs = (text: string): Array<readonly [string, string]> => {
+  const pairs: Array<readonly [string, string]> = [];
+  const len = text.length;
+  let i = 0;
+
+  const readQuoted = (
+    pos: number,
+    escaped: boolean,
+  ): { value: string; next: number } | undefined => {
+    let cur = pos;
+    let out = '';
+    while (cur < len) {
+      const ch = text[cur];
+      if (escaped) {
+        if (ch === '\\' && text[cur + 1] === '"') {
+          return { value: out, next: cur + 2 };
+        }
+        if (ch === '\\' && cur + 1 < len) {
+          out += text[cur + 1];
+          cur += 2;
+          continue;
+        }
+        if (ch === '"') return undefined;
+      } else {
+        if (ch === '"') return { value: out, next: cur + 1 };
+        if (ch === '\\' && cur + 1 < len) {
+          out += text[cur + 1];
+          cur += 2;
+          continue;
+        }
+      }
+      out += ch ?? '';
+      cur++;
+    }
+    return undefined;
+  };
+
+  while (i < len) {
+    const isEscapedQuote = text[i] === '\\' && text[i + 1] === '"';
+    const isRawQuote = text[i] === '"';
+    if (!isEscapedQuote && !isRawQuote) {
+      i++;
+      continue;
+    }
+
+    const keyStart = isEscapedQuote ? i + 2 : i + 1;
+    const keyRes = readQuoted(keyStart, isEscapedQuote);
+    if (!keyRes) {
+      i++;
+      continue;
+    }
+
+    let j = keyRes.next;
+    while (
+      j < len &&
+      (text[j] === ' ' || text[j] === '\t' || text[j] === '\r' || text[j] === '\n')
+    ) {
+      j++;
+    }
+    if (text[j] !== ':') {
+      i = keyRes.next;
+      continue;
+    }
+    j++;
+    while (
+      j < len &&
+      (text[j] === ' ' || text[j] === '\t' || text[j] === '\r' || text[j] === '\n')
+    ) {
+      j++;
+    }
+
+    const valMatchesQuote = isEscapedQuote
+      ? text[j] === '\\' && text[j + 1] === '"'
+      : text[j] === '"';
+    if (!valMatchesQuote) {
+      i = j;
+      continue;
+    }
+
+    const valStart = isEscapedQuote ? j + 2 : j + 1;
+    const valRes = readQuoted(valStart, isEscapedQuote);
+    if (!valRes) {
+      i = j + 1;
+      continue;
+    }
+
+    if (/^[A-Za-z0-9_-]+$/.test(keyRes.value)) {
+      pairs.push([keyRes.value, valRes.value]);
+    }
+    i = valRes.next;
+  }
+
+  return pairs;
+};
 
 const scrubAuthorizationHeaderValue = (
   value: string,
@@ -216,7 +365,8 @@ const toHeaderEntries = (headers: HeaderInput): Array<[string, string]> => {
 
 export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
   const placeholderFor = options.placeholderFor ?? defaultPlaceholderFor;
-  const knownSecrets = normalizeKnownSecrets(options.knownSecrets);
+  const minKnownSecretLength = options.minKnownSecretLength ?? DEFAULT_MIN_KNOWN_SECRET_LENGTH;
+  const knownSecretsPattern = buildKnownSecretsPattern(options.knownSecrets, minKnownSecretLength);
   const customRules = options.rules ?? [];
   const scrubPaths = options.scrubPaths ?? true;
   const scrubEmails = options.scrubEmails ?? true;
@@ -234,8 +384,8 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
   }
   const queryParamPattern = buildQueryParamPattern(secretQueryParams);
 
-  const extraSecretKeys = options.extraSecretKeyPatterns ?? [];
-  const extraIdentityKeys = options.extraIdentityKeyPatterns ?? [];
+  const extraSecretKeys = (options.extraSecretKeyPatterns ?? []).map(stripStatefulFlags);
+  const extraIdentityKeys = (options.extraIdentityKeyPatterns ?? []).map(stripStatefulFlags);
 
   const isSecretKey = (key: string): boolean =>
     secretHeaders.has(key.toLowerCase()) ||
@@ -250,6 +400,10 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
   for (const rule of customRules) {
     if (typeof rule.placeholder === 'string') customPlaceholderValues.add(rule.placeholder);
   }
+  const safePlaceholderValues = buildSafePlaceholderSet(placeholderFor, customPlaceholderValues);
+  const safePlaceholderLower = new Set<string>(
+    [...safePlaceholderValues].map((v) => v.toLowerCase()),
+  );
 
   const pathRuleCache = new Map<string, Array<[RegExp, string]>>();
   const resolvePathRules = (context: ScrubContext): Array<[RegExp, string]> => {
@@ -265,26 +419,27 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
     return computed;
   };
 
+  const scrubKnownSecrets = (text: string): string => {
+    if (!knownSecretsPattern || !text) return text;
+    return text.replace(new RegExp(knownSecretsPattern.source, 'g'), (match) =>
+      placeholderFor('secret', match),
+    );
+  };
+
   const scrubText = (text: string, overrideContext?: ScrubContext): string => {
     if (!text) return text;
     const context = mergeContexts(options.context, overrideContext);
-    let out = text;
-
-    // Explicit known secrets run FIRST so malformed or short literals never slip past regexes.
-    for (const secret of knownSecrets) {
-      if (out.includes(secret)) {
-        out = out.replaceAll(secret, formatPlaceholder(placeholderFor, 'secret', secret));
-      }
-    }
+    let out = scrubKnownSecrets(text);
 
     for (const [pattern, replacement] of resolvePathRules(context)) {
-      out = out.replace(pattern, replacement);
+      const literal = replacement;
+      out = out.replace(new RegExp(pattern.source, pattern.flags), () => literal);
     }
 
     for (const detector of BUILT_IN_SECRET_DETECTORS) {
       const regex = new RegExp(detector.pattern.source, ensureGlobalFlags(detector.pattern.flags));
       out = out.replace(regex, (match, ...args: unknown[]) => {
-        const placeholder = formatPlaceholder(placeholderFor, detector.kind, match);
+        const placeholder = placeholderFor(detector.kind, match);
         if (detector.preserveGroup !== undefined) {
           const groupVal = args[detector.preserveGroup - 1];
           const prefix = typeof groupVal === 'string' ? groupVal : '';
@@ -296,8 +451,10 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
 
     out = out.replace(
       new RegExp(queryParamPattern.source, ensureGlobalFlags(queryParamPattern.flags)),
-      (match, prefix: string) =>
-        `${prefix}${formatPlaceholder(placeholderFor, 'query_secret', match)}`,
+      (match, prefix: string, valuePart: string) =>
+        isSafePlaceholder(valuePart, safePlaceholderValues, safePlaceholderLower)
+          ? match
+          : `${prefix}${placeholderFor('query_secret', match)}`,
     );
 
     out = out.replace(
@@ -305,29 +462,30 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
         INLINE_ENV_SECRET_PATTERN.source,
         ensureGlobalFlags(INLINE_ENV_SECRET_PATTERN.flags),
       ),
-      (match, prefix: string) => `${prefix}${formatPlaceholder(placeholderFor, 'secret', match)}`,
+      (match, prefix: string, quote: string, valuePart: string) =>
+        isSafePlaceholder(valuePart, safePlaceholderValues, safePlaceholderLower)
+          ? match
+          : `${prefix}${quote}${placeholderFor('secret', match)}${quote}`,
     );
 
     if (scrubEmails) {
       out = out.replace(new RegExp(EMAIL_PATTERN.source, 'g'), (match) =>
-        formatPlaceholder(placeholderFor, 'email', match),
+        placeholderFor('email', match),
       );
     }
 
     if (scrubIps) {
       out = out.replace(new RegExp(IPV4_PATTERN.source, 'g'), (match) =>
-        match === '0.0.0.0' ? match : formatPlaceholder(placeholderFor, 'ip', match),
+        match === '0.0.0.0' ? match : placeholderFor('ip', match),
       );
       out = out.replace(new RegExp(IPV6_PATTERN.source, 'g'), (match) =>
-        formatPlaceholder(placeholderFor, 'ip', match),
+        placeholderFor('ip', match),
       );
     }
 
     if (scrubUuids) {
       out = out.replace(new RegExp(UUID_GLOBAL_PATTERN.source, 'gi'), (match) =>
-        match === formatPlaceholder(placeholderFor, 'uuid', match)
-          ? match
-          : formatPlaceholder(placeholderFor, 'uuid', match),
+        placeholderFor('uuid', match),
       );
     }
 
@@ -338,62 +496,81 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
     return out;
   };
 
+  const scrubParamEntries = (
+    params: URLSearchParams,
+    context: ScrubContext,
+    sortKeys: boolean,
+  ): string => {
+    const entries: Array<[string, string]> = [];
+    params.forEach((value, key) => {
+      entries.push([key, value]);
+    });
+    if (sortKeys) entries.sort(([a], [b]) => a.localeCompare(b));
+    return entries
+      .map(([key, value]) => {
+        const encodedKey = encodeURIComponent(key);
+        if (secretQueryParams.has(key.toLowerCase())) {
+          return `${encodedKey}=${placeholderFor('query_secret', value)}`;
+        }
+        const scrubbedVal = scrubText(value, context);
+        if (isSafePlaceholder(scrubbedVal, safePlaceholderValues, safePlaceholderLower)) {
+          return `${encodedKey}=${scrubbedVal}`;
+        }
+        return `${encodedKey}=${encodeURIComponent(scrubbedVal)}`;
+      })
+      .join('&');
+  };
+
   const scrubUrl = (rawUrl: string, overrideContext?: ScrubContext): string => {
     const context = mergeContexts(options.context, overrideContext);
-    // Apply knownSecrets first so secrets embedded anywhere in the URL are caught even if malformed.
-    let pre = rawUrl;
-    for (const secret of knownSecrets) {
-      if (pre.includes(secret)) {
-        pre = pre.replaceAll(secret, formatPlaceholder(placeholderFor, 'secret', secret));
-      }
-    }
+    const isProtocolRelative = rawUrl.startsWith('//');
+    const isAbsolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawUrl);
 
-    const isAbsolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(pre);
     let parsed: URL;
     try {
-      parsed = isAbsolute ? new URL(pre) : new URL(pre, 'http://vcr.invalid');
+      parsed = isProtocolRelative
+        ? new URL(`http:${rawUrl}`)
+        : isAbsolute
+          ? new URL(rawUrl)
+          : new URL(rawUrl, 'http://vcr.invalid');
     } catch {
-      return scrubText(pre, context);
+      return scrubText(rawUrl, context);
     }
 
     const scrubbedPath = scrubText(parsed.pathname, context);
-    const paramEntries: Array<[string, string]> = [];
-    parsed.searchParams.forEach((value, key) => {
-      paramEntries.push([key, value]);
-    });
-    paramEntries.sort(([a], [b]) => a.localeCompare(b));
+    const queryStr = scrubParamEntries(parsed.searchParams, context, true);
+    const queryString = queryStr ? `?${queryStr}` : '';
 
-    const queryParts = paramEntries.map(([key, value]) => {
-      const encodedKey = encodeURIComponent(key);
-      if (secretQueryParams.has(key.toLowerCase())) {
-        return `${encodedKey}=${formatPlaceholder(placeholderFor, 'query_secret', value)}`;
+    let hash = '';
+    if (parsed.hash) {
+      const rawFragment = parsed.hash.slice(1);
+      if (rawFragment.includes('=')) {
+        const fragmentParams = new URLSearchParams(rawFragment);
+        hash = `#${scrubParamEntries(fragmentParams, context, false)}`;
+      } else {
+        hash = `#${scrubText(rawFragment, context)}`;
       }
-      const scrubbedVal = scrubText(value, context);
-      if (SAFE_PLACEHOLDER_PATTERN.test(scrubbedVal)) {
-        return `${encodedKey}=${scrubbedVal}`;
-      }
-      return `${encodedKey}=${encodeURIComponent(scrubbedVal)}`;
-    });
+    }
 
-    const queryString = queryParts.length ? `?${queryParts.join('&')}` : '';
-    const hash = parsed.hash ? scrubText(parsed.hash, context) : '';
-
-    if (!isAbsolute) {
+    if (!isAbsolute && !isProtocolRelative) {
       return `${scrubbedPath}${queryString}${hash}`;
     }
 
     let authority = parsed.host;
     if (parsed.username || parsed.password) {
-      const userPart = parsed.username
-        ? scrubText(decodeURIComponent(parsed.username), context)
-        : '';
-      const passPart = parsed.password
-        ? `:${formatPlaceholder(placeholderFor, 'url_credential', parsed.password)}`
-        : '';
-      authority = `${userPart}${passPart}@${parsed.host}`;
+      const decodedUser = parsed.username ? safeDecodeURIComponent(parsed.username) : '';
+      if (parsed.password) {
+        const userPart = decodedUser ? scrubText(decodedUser, context) : '';
+        const passPart = `:${placeholderFor('url_credential', parsed.password)}`;
+        authority = `${userPart}${passPart}@${parsed.host}`;
+      } else {
+        // Username-only credentials (e.g. https://<token>@github.com) are scrubbed whole.
+        authority = `${placeholderFor('url_credential', decodedUser)}@${parsed.host}`;
+      }
     }
 
-    return `${parsed.protocol}//${authority}${scrubbedPath}${queryString}${hash}`;
+    const schemePrefix = isProtocolRelative ? '//' : `${parsed.protocol}//`;
+    return `${schemePrefix}${authority}${scrubbedPath}${queryString}${hash}`;
   };
 
   const scrubHeaders = (
@@ -410,9 +587,11 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
       if (key === 'authorization' || key === 'proxy-authorization') {
         out[key] = scrubAuthorizationHeaderValue(value, placeholderFor);
       } else if (secretHeaders.has(key)) {
-        out[key] = formatPlaceholder(placeholderFor, 'header_secret', value);
+        out[key] = placeholderFor('header_secret', value);
       } else {
-        out[key] = scrubText(value, context);
+        const scrubbedVal = scrubText(value, context);
+        const existing = out[key];
+        out[key] = existing !== undefined ? `${existing}, ${scrubbedVal}` : scrubbedVal;
       }
     }
     return out;
@@ -420,9 +599,9 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
 
   const scrubIdentityLeaf = (value: string): string => {
     if (value === '') return value;
-    if (UUID_EXACT_PATTERN.test(value)) return formatPlaceholder(placeholderFor, 'uuid', value);
-    if (value.includes('@')) return formatPlaceholder(placeholderFor, 'email', value);
-    return formatPlaceholder(placeholderFor, 'key_secret', value);
+    if (UUID_EXACT_PATTERN.test(value)) return placeholderFor('uuid', value);
+    if (value.includes('@')) return placeholderFor('email', value);
+    return placeholderFor('key_secret', value);
   };
 
   const scrubValue = <T>(value: T, overrideContext?: ScrubContext): T => {
@@ -442,7 +621,7 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
 
       if (typeof node === 'string') {
         if (options.allowValue?.(key, node)) return node;
-        if (isSafePlaceholder(node, placeholderFor, customPlaceholderValues)) return node;
+        if (isSafePlaceholder(node, safePlaceholderValues, safePlaceholderLower)) return node;
         if (secretBranch) {
           if (
             key !== undefined &&
@@ -451,9 +630,9 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
             return scrubAuthorizationHeaderValue(node, placeholderFor);
           }
           if (key !== undefined && secretHeaders.has(key.toLowerCase())) {
-            return formatPlaceholder(placeholderFor, 'header_secret', node);
+            return placeholderFor('header_secret', node);
           }
-          return formatPlaceholder(placeholderFor, 'key_secret', node);
+          return placeholderFor('key_secret', node);
         }
         if (identityBranch) return scrubIdentityLeaf(node);
         return scrubText(node, context);
@@ -469,11 +648,23 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
       ancestors.add(node);
       try {
         if (node instanceof Error) {
-          return {
-            name: node.name,
+          const out: Record<string, unknown> = {
+            name: scrubText(node.name, context),
             message: scrubText(node.message, context),
-            ...(node.stack ? { stack: scrubText(node.stack, context) } : {}),
           };
+          if (node.stack) out.stack = scrubText(node.stack, context);
+          if ('cause' in node && node.cause !== undefined) {
+            out.cause = walk(node.cause, 'cause', secretBranch, identityBranch);
+          }
+          for (const [extraKey, extraVal] of Object.entries(node)) {
+            out[scrubText(extraKey, context)] = walk(
+              extraVal,
+              extraKey,
+              secretBranch,
+              identityBranch,
+            );
+          }
+          return out;
         }
         if (node instanceof Map) {
           const out = new Map<unknown, unknown>();
@@ -530,11 +721,16 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
 
   const rehydratePlaceholders = (text: string, overrideContext?: ScrubContext): string => {
     const context = mergeContexts(options.context, overrideContext);
-    let out = text.replaceAll('{{tmp}}', tmpdir().replace(/\/+$/, ''));
-    if (context.cwd) out = out.replaceAll('{{cwd}}', context.cwd);
+    const tmpVal = tmpdir().replace(/\/+$/, '');
+    let out = text.replaceAll('{{tmp}}', () => tmpVal);
+    if (context.cwd) {
+      const cwdVal = context.cwd;
+      out = out.replaceAll('{{cwd}}', () => cwdVal);
+    }
     if (context.pathPlaceholders) {
       for (const [placeholder, rawPath] of Object.entries(context.pathPlaceholders)) {
-        out = out.replaceAll(placeholder, rawPath);
+        const targetVal = rawPath;
+        out = out.replaceAll(placeholder, () => targetVal);
       }
     }
     return out;
@@ -545,8 +741,14 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
     path: string | undefined,
     findings: LeakFinding[],
   ): void => {
-    for (const secret of knownSecrets) {
-      if (text.includes(secret)) {
+    if (!text) return;
+
+    if (knownSecretsPattern) {
+      const safeSpans = collectSafeSpans(text, safePlaceholderValues);
+      for (const match of text.matchAll(new RegExp(knownSecretsPattern.source, 'g'))) {
+        const start = match.index ?? 0;
+        const end = start + match[0].length;
+        if (isInsideSpans(start, end, safeSpans)) continue;
         findings.push({
           kind: 'known_secret',
           message: 'contains a known secret literal',
@@ -576,7 +778,7 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
       const regex = new RegExp(detector.pattern.source, ensureGlobalFlags(detector.pattern.flags));
       for (const match of text.matchAll(regex)) {
         const matchedText = match[0];
-        if (isSafePlaceholder(matchedText, placeholderFor, customPlaceholderValues)) continue;
+        if (isSafePlaceholder(matchedText, safePlaceholderValues, safePlaceholderLower)) continue;
         if (
           detector.preserveGroup !== undefined &&
           typeof match[detector.preserveGroup] === 'string'
@@ -586,7 +788,7 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
             match[detector.preserveGroup].length,
             suffixLen > 0 ? -suffixLen : undefined,
           );
-          if (isSafePlaceholder(secretPart, placeholderFor, customPlaceholderValues)) continue;
+          if (isSafePlaceholder(secretPart, safePlaceholderValues, safePlaceholderLower)) continue;
         }
         findings.push({
           kind: detector.id,
@@ -597,50 +799,53 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
       }
     }
 
-    if (new RegExp(queryParamPattern.source, stripGlobalFlag(queryParamPattern.flags)).test(text)) {
+    for (const match of text.matchAll(
+      new RegExp(queryParamPattern.source, ensureGlobalFlags(queryParamPattern.flags)),
+    )) {
+      const valuePart = match[2] ?? '';
+      if (isSafePlaceholder(valuePart, safePlaceholderValues, safePlaceholderLower)) continue;
       findings.push({
         kind: 'query_secret',
         message: 'contains an unredacted secret query parameter',
         ...(path ? { path } : {}),
       });
+      break;
     }
 
-    if (
+    for (const match of text.matchAll(
       new RegExp(
         INLINE_ENV_SECRET_PATTERN.source,
-        stripGlobalFlag(INLINE_ENV_SECRET_PATTERN.flags),
-      ).test(text)
-    ) {
+        ensureGlobalFlags(INLINE_ENV_SECRET_PATTERN.flags),
+      ),
+    )) {
+      const valuePart = match[3] ?? '';
+      if (isSafePlaceholder(valuePart, safePlaceholderValues, safePlaceholderLower)) continue;
       findings.push({
         kind: 'inline_secret',
         message: 'contains an unredacted inline secret assignment',
         ...(path ? { path } : {}),
       });
+      break;
     }
 
     for (const rule of customRules) {
       if (rule.checkLeak === false) continue;
-      const regex = new RegExp(rule.pattern.source, stripGlobalFlag(rule.pattern.flags));
-      if (regex.test(text)) {
+      const regex = new RegExp(rule.pattern.source, ensureGlobalFlags(rule.pattern.flags));
+      for (const match of text.matchAll(regex)) {
+        if (isSafePlaceholder(match[0], safePlaceholderValues, safePlaceholderLower)) continue;
         findings.push({
           kind: rule.id,
           message: `matched custom secret rule "${rule.id}"`,
           ...(path ? { path } : {}),
         });
+        break;
       }
     }
 
-    // Check escaped or raw `"key": "value"` pairs embedded inside text streams.
-    for (const match of text.matchAll(
-      /(\\*)"([A-Za-z0-9_-]+)\1"\s*:\s*\1"((?:[^"\\]|\\(?!\1"))*)\1"/g,
-    )) {
-      const key = match[2];
-      const val = match[3];
+    for (const [key, val] of extractJsonStringPairs(text)) {
       if (
-        key !== undefined &&
-        val !== undefined &&
         (isSecretKey(key) || isIdentityKey(key)) &&
-        !isSafePlaceholder(val, placeholderFor, customPlaceholderValues) &&
+        !isSafePlaceholder(val, safePlaceholderValues, safePlaceholderLower) &&
         !options.allowValue?.(key, val)
       ) {
         findings.push({
@@ -650,6 +855,29 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
         });
       }
     }
+  };
+
+  const inspectKeyForLeaks = (
+    rawKey: string,
+    parentPath: string | undefined,
+    findings: LeakFinding[],
+  ): string => {
+    const keyFindings: LeakFinding[] = [];
+    scanStringForLeaks(rawKey, undefined, keyFindings);
+    if (keyFindings.length === 0) {
+      return parentPath ? `${parentPath}.${rawKey}` : rawKey;
+    }
+    const safePath = parentPath
+      ? `${parentPath}.${SECRET_KEY_REDACTED_SEGMENT}`
+      : SECRET_KEY_REDACTED_SEGMENT;
+    for (const finding of keyFindings) {
+      findings.push({
+        kind: finding.kind,
+        message: `${finding.message} in object/map key`,
+        path: safePath,
+      });
+    }
+    return safePath;
   };
 
   const findUnscrubbedSecrets = (input: unknown): LeakFinding[] => {
@@ -671,7 +899,7 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
       if (typeof node === 'string') {
         if (
           (secretBranch || identityBranch) &&
-          !isSafePlaceholder(node, placeholderFor, customPlaceholderValues) &&
+          !isSafePlaceholder(node, safePlaceholderValues, safePlaceholderLower) &&
           !options.allowValue?.(key, node)
         ) {
           findings.push({
@@ -682,32 +910,84 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
         }
         scanStringForLeaks(node, path, findings);
 
-        // Inspect embedded JSON objects inside string fields (e.g. protocol frames or raw HTTP bodies).
-        for (let start = node.indexOf('{'); start !== -1; start = node.indexOf('{', start + 1)) {
+        // Bounded scan for embedded JSON objects or arrays inside string fields.
+        let attempts = 0;
+        for (let idx = 0; idx < node.length && attempts < MAX_EMBEDDED_JSON_ATTEMPTS; idx++) {
+          const ch = node[idx];
+          if (ch !== '{' && ch !== '[') continue;
+          const remaining = node.length - idx;
+          if (remaining > MAX_EMBEDDED_JSON_SLICE_BYTES) continue;
+          attempts++;
           try {
-            const parsed = JSON.parse(node.slice(start)) as unknown;
+            const parsed = JSON.parse(node.slice(idx)) as unknown;
             if (parsed && typeof parsed === 'object') {
               walk(parsed, undefined, path, false, false);
               break;
             }
           } catch {
-            /* Not JSON starting at this offset. */
+            /* Not valid JSON starting at this offset. */
           }
         }
         return;
       }
 
-      if (node === null || typeof node !== 'object' || node instanceof Uint8Array) return;
+      if (node === null || typeof node !== 'object') return;
+
+      if (node instanceof Uint8Array) {
+        const decoded = new TextDecoder('utf-8', { fatal: false }).decode(node);
+        scanStringForLeaks(decoded, path, findings);
+        return;
+      }
+
+      if (node instanceof URL) {
+        scanStringForLeaks(node.toString(), path, findings);
+        return;
+      }
+
       if (node instanceof Headers) {
         for (const [hKey, hVal] of toHeaderEntries(node)) {
-          const childPath = path ? `${path}.${hKey}` : hKey;
+          const childPath = inspectKeyForLeaks(hKey, path, findings);
           walk(hVal, hKey, childPath, secretBranch, identityBranch);
         }
         return;
       }
+
       if (ancestors.has(node)) return;
       ancestors.add(node);
       try {
+        if (node instanceof Error) {
+          walk(node.name, 'name', path ? `${path}.name` : 'name', secretBranch, identityBranch);
+          walk(
+            node.message,
+            'message',
+            path ? `${path}.message` : 'message',
+            secretBranch,
+            identityBranch,
+          );
+          if (node.stack) {
+            walk(
+              node.stack,
+              'stack',
+              path ? `${path}.stack` : 'stack',
+              secretBranch,
+              identityBranch,
+            );
+          }
+          if ('cause' in node && node.cause !== undefined) {
+            walk(
+              node.cause,
+              'cause',
+              path ? `${path}.cause` : 'cause',
+              secretBranch,
+              identityBranch,
+            );
+          }
+          for (const [extraKey, extraVal] of Object.entries(node)) {
+            const childPath = inspectKeyForLeaks(extraKey, path, findings);
+            walk(extraVal, extraKey, childPath, secretBranch, identityBranch);
+          }
+          return;
+        }
         if (Array.isArray(node)) {
           for (let index = 0; index < node.length; index++) {
             const childPath = path ? `${path}[${index}]` : `[${index}]`;
@@ -717,9 +997,12 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
         }
         if (node instanceof Map) {
           for (const [k, v] of node.entries()) {
-            const keyStr = String(k);
-            const childPath = path ? `${path}.${keyStr}` : keyStr;
-            walk(v, keyStr, childPath, secretBranch, identityBranch);
+            const keyStr = typeof k === 'string' ? k : String(k);
+            const childPath = inspectKeyForLeaks(keyStr, path, findings);
+            if (k && typeof k === 'object') {
+              walk(k, undefined, childPath, secretBranch, identityBranch);
+            }
+            walk(v, typeof k === 'string' ? k : undefined, childPath, secretBranch, identityBranch);
           }
           return;
         }
@@ -732,7 +1015,7 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
           return;
         }
         for (const [childKey, childValue] of Object.entries(node)) {
-          const childPath = path ? `${path}.${childKey}` : childKey;
+          const childPath = inspectKeyForLeaks(childKey, path, findings);
           walk(childValue, childKey, childPath, secretBranch, identityBranch);
         }
       } finally {
@@ -742,7 +1025,6 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
 
     walk(input, undefined, undefined, false, false);
 
-    // Deduplicate findings by (kind, path) while preserving order.
     const seen = new Set<string>();
     return findings.filter((finding) => {
       const dedupeKey = `${finding.kind}::${finding.path ?? ''}`;
@@ -782,6 +1064,13 @@ export const createScrubber = (options: ScrubOptions = {}): Scrubber => {
 };
 
 const defaultScrubber = createScrubber();
+
+/** Internal shared helper resolving either a `Scrubber` handle or `ScrubOptions` into a `Scrubber`. */
+export const resolveScrubber = (input?: Scrubber | ScrubOptions): Scrubber => {
+  if (!input) return defaultScrubber;
+  if ('scrubText' in input && 'assertScrubbed' in input) return input;
+  return createScrubber(input);
+};
 
 export const scrubText = (text: string, options?: ScrubOptions): string =>
   options ? createScrubber(options).scrubText(text) : defaultScrubber.scrubText(text);

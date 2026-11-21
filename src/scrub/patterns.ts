@@ -74,7 +74,7 @@ export const DEFAULT_SECRET_QUERY_PARAMS: readonly string[] = [
 ];
 
 export const DEFAULT_SECRET_KEY_PATTERN =
-  /^(authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|x[-_]?api[-_]?key|x[-_]?goog[-_]?api[-_]?key|x[-_]?amz[-_]?security[-_]?token|stripe[-_]?signature|api[-_]?key|apiKey|(access|refresh|id|session|auth)[-_]?token|(access|refresh|id|session|auth)Token|client[-_]?secret|clientSecret|private[-_]?key|privateKey|signing[-_]?secret|signingSecret|secret|password|passwd|credential|credentials|token)$/i;
+  /^(authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|x[-_]?api[-_]?key|x[-_]?goog[-_]?api[-_]?key|x[-_]?amz[-_]?security[-_]?token|stripe[-_]?signature|api[-_]?key|apiKey|api[-_]?secret|apiSecret|webhook[-_]?secret|webhookSecret|oauth[-_]?token|oauthToken|(access|refresh|id|session|auth)[-_]?token|(access|refresh|id|session|auth)Token|client[-_]?secret|clientSecret|private[-_]?key|privateKey|signing[-_]?secret|signingSecret|secret|password|passwd|credential|credentials|token)$/i;
 
 export const DEFAULT_IDENTITY_KEY_PATTERN =
   /^(e-?mail(_?address|Address)?|org(ani[sz]ation)?(_?(id|uuid|name|role)|(Id|Uuid|Name|Role))?|account(_?(id|uuid|name|email|type)|(Id|Uuid|Name|Email|Type))?|user(_?(id|uuid|email|name)|(Id|Uuid|Email|Name))|billing(_?\w+|[A-Z]\w*)?|subscription(_?(id|type|plan)|(Id|Type|Plan))?|plan(_?type|Type)|workspace(_?(id|name)|(Id|Name))|installation(_?id|Id)|chatgpt(_?(account|user|plan)(_?\w+)?))$/i;
@@ -84,8 +84,9 @@ export const UUID_EXACT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 export const UUID_GLOBAL_PATTERN =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 
+// Bounded + negative lookbehind to guarantee O(n) execution on long non-matching strings.
 export const EMAIL_PATTERN =
-  /[A-Za-z0-9._%+-]+@(?!example\.invalid\b)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g;
+  /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@(?!example\.invalid\b)(?:[A-Za-z0-9-]{1,63}\.){1,8}[A-Za-z]{2,24}\b/g;
 
 export const IPV4_PATTERN =
   /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g;
@@ -99,7 +100,7 @@ export interface BuiltInSecretDetector {
   readonly id: string;
   readonly kind: ScrubPlaceholderKind;
   readonly pattern: RegExp;
-  /** Prefix preserved when scrubbing (e.g. `Bearer ` before `<REDACTED:BEARER>`). */
+  /** Capture group index preserved before the placeholder (e.g. `Bearer ` before `<REDACTED:BEARER>`). */
   readonly preserveGroup?: number;
   readonly suffix?: string;
 }
@@ -108,7 +109,8 @@ export const BUILT_IN_SECRET_DETECTORS: readonly BuiltInSecretDetector[] = [
   {
     id: 'pem_private_key',
     kind: 'private_key',
-    pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+    pattern:
+      /-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?-----END (?:[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----/g,
   },
   {
     id: 'anthropic_key',
@@ -204,14 +206,15 @@ export const BUILT_IN_SECRET_DETECTORS: readonly BuiltInSecretDetector[] = [
   {
     id: 'url_basic_auth',
     kind: 'url_credential',
-    pattern: /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]*:)(?!<REDACTED:)[^\s/]+@/gi,
+    pattern: /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@"']*:)((?!<REDACTED:)[^\s/@"',}]+)@/gi,
     preserveGroup: 1,
     suffix: '@',
   },
 ];
 
+// Bounded + negative lookbehind for O(n) execution; matches uppercase/lowercase env and config assignments.
 export const INLINE_ENV_SECRET_PATTERN =
-  /\b([A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*\s*[=:]\s*)["']?(?!<REDACTED:|REDACTED\b)[^\s"',}]{8,}["']?/g;
+  /(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]{1,32}[_-]){0,4}(?:key|secret|token|password|passwd)(?:[_-][A-Za-z0-9]{1,32}){0,2})\s*[=:]\s*)(["']?)(?!<REDACTED:|REDACTED\b)([^\s"',}]{8,})\2/gi;
 
 export const SAFE_PLACEHOLDER_PATTERN =
   /^(?:<REDACTED(?::[A-Z0-9_-]+)?>|(?:Bearer|Basic|DPoP|FlyV1)\s+<REDACTED(?::[A-Z0-9_-]+)?>|REDACTED|MASKED|00000000-0000-4000-8000-000000000000|redacted@example\.invalid)$/i;

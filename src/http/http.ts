@@ -1,4 +1,5 @@
 import { VcrError } from '../core/errors';
+import { readCassetteBody } from '../core/fs-utils';
 import type { VcrRecorder } from '../core/recorder';
 import { defineVcrTransport } from '../core/transport';
 import type { VcrCassette, VcrTransport } from '../core/types';
@@ -7,6 +8,30 @@ import type { Scrubber } from '../scrub/types';
 export const DEFAULT_KEPT_RESPONSE_HEADERS: readonly string[] = ['content-type'];
 
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+
+const BINARY_CONTENT_TYPE_PREFIXES = ['image/', 'audio/', 'video/', 'font/'];
+const BINARY_CONTENT_TYPES = new Set([
+  'application/octet-stream',
+  'application/pdf',
+  'application/zip',
+  'application/gzip',
+  'application/x-gzip',
+  'application/wasm',
+  'application/protobuf',
+  'application/x-protobuf',
+  'application/grpc',
+]);
+
+const CONTENT_TYPE_EXTENSIONS: Readonly<Record<string, string>> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'application/pdf': '.pdf',
+  'application/zip': '.zip',
+  'application/gzip': '.gz',
+  'application/wasm': '.wasm',
+};
 
 export interface RecordedHttpRequest {
   readonly method: string;
@@ -25,7 +50,7 @@ export interface HttpCassetteOptions {
   readonly keptResponseHeaders?: readonly string[];
   /** Require URL origin to match during replay. Defaults to false. */
   readonly matchOrigin?: boolean;
-  /** Require scrubbed request body to match during replay. Defaults to false. */
+  /** Require canonical scrubbed request body to match during replay. Defaults to false. */
   readonly matchBody?: boolean;
   /** Specific scrubbed request header names that must match during replay. */
   readonly matchHeaders?: readonly string[];
@@ -49,16 +74,70 @@ const parseBodyText = (text: string): unknown => {
   }
 };
 
+const canonicalJson = (value: unknown): string => {
+  const sort = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(sort);
+    if (node && typeof node === 'object') {
+      return Object.fromEntries(
+        Object.entries(node as Record<string, unknown>)
+          .filter(([, v]) => v !== undefined)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([k, v]) => [k, sort(v)]),
+      );
+    }
+    return node;
+  };
+  return JSON.stringify(sort(value));
+};
+
+const mimeTypeOf = (contentType: string | null): string =>
+  (contentType ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
+
+const isBinaryContentType = (contentType: string | null): boolean => {
+  const mime = mimeTypeOf(contentType);
+  if (!mime) return false;
+  if (BINARY_CONTENT_TYPES.has(mime)) return true;
+  return BINARY_CONTENT_TYPE_PREFIXES.some((prefix) => mime.startsWith(prefix));
+};
+
+const extensionForContentType = (contentType: string | null): string =>
+  CONTENT_TYPE_EXTENSIONS[mimeTypeOf(contentType)] ?? '.bin';
+
+const decodeBodyBytes = (
+  bytes: Uint8Array,
+  contentType: string | null,
+):
+  | { readonly binary: true; readonly bytes: Uint8Array; readonly extension: string }
+  | { readonly binary: false; readonly text: string } => {
+  if (bytes.length === 0) return { binary: false, text: '' };
+  if (isBinaryContentType(contentType)) {
+    return { binary: true, bytes, extension: extensionForContentType(contentType) };
+  }
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return { binary: false, text };
+  } catch {
+    return { binary: true, bytes, extension: extensionForContentType(contentType) };
+  }
+};
+
+const decodeBodySource = (body: BodyInit | null | undefined): string | undefined => {
+  if (body === undefined || body === null) return undefined;
+  if (typeof body === 'string') return body;
+  if (body instanceof URLSearchParams) return body.toString();
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+  if (ArrayBuffer.isView(body)) {
+    return new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+  }
+  return undefined;
+};
+
 const extractBodyText = async (
   input: string | URL | Request,
   init?: RequestInit,
 ): Promise<string | undefined> => {
-  if (init?.body !== undefined && init.body !== null) {
-    if (typeof init.body === 'string') return init.body;
-    if (init.body instanceof URLSearchParams) return init.body.toString();
-    if (init.body instanceof Uint8Array) return new TextDecoder().decode(init.body);
-    return undefined;
-  }
+  const fromInit = decodeBodySource(init?.body);
+  if (fromInit !== undefined) return fromInit;
   if (input instanceof Request && input.body !== null) {
     try {
       const text = await input.clone().text();
@@ -68,6 +147,30 @@ const extractBodyText = async (
     }
   }
   return undefined;
+};
+
+const extractKeptResponseHeaders = (
+  responseHeaders: Headers,
+  keptNames: readonly string[],
+): Record<string, string> => {
+  const raw: Record<string, string> = {};
+  for (const name of keptNames) {
+    const value = responseHeaders.get(name);
+    if (value !== null) raw[name.toLowerCase()] = value;
+  }
+  return raw;
+};
+
+const pickKeptHeaders = (
+  responseHeaders: Headers,
+  keptNames: readonly string[],
+  scrubber: Scrubber,
+): Record<string, string> =>
+  scrubber.scrubHeaders(extractKeptResponseHeaders(responseHeaders, keptNames));
+
+const checkAborted = (signal: AbortSignal | null | undefined): void => {
+  if (!signal?.aborted) return;
+  throw signal.reason ?? new DOMException('The operation was aborted.', 'AbortError');
 };
 
 /** Normalizes and scrubs an HTTP fetch input + init pair into a deterministic `RecordedHttpRequest`. */
@@ -114,23 +217,10 @@ const defaultMatchHttpRequest = (
       }
     }
   }
-  if (options.matchBody && JSON.stringify(recorded.body) !== JSON.stringify(incoming.body)) {
+  if (options.matchBody && canonicalJson(recorded.body) !== canonicalJson(incoming.body)) {
     return `request body for ${incoming.method} ${incoming.path} differs from the recording`;
   }
   return undefined;
-};
-
-const pickKeptHeaders = (
-  responseHeaders: Headers,
-  keptNames: readonly string[],
-  scrubber: Scrubber,
-): Record<string, string> => {
-  const raw: Record<string, string> = {};
-  for (const name of keptNames) {
-    const value = responseHeaders.get(name);
-    if (value !== null) raw[name.toLowerCase()] = value;
-  }
-  return scrubber.scrubHeaders(raw);
 };
 
 /** Creates a drop-in `fetch` function backed by queued cassettes on `recorder`. */
@@ -146,10 +236,14 @@ export const createVcrFetch = (
     input: string | URL | Request,
     init?: RequestInit,
   ): Promise<Response> => {
+    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    checkAborted(signal);
+
     const cassettePath = recorder.popCassettePath(method);
     const incoming = await describeHttpRequest(input, init, recorder.scrubber, options.matchOrigin);
 
     if (recorder.shouldReplay(cassettePath)) {
+      checkAborted(signal);
       const saved = recorder.fetchCassette<RecordedHttpRequest, unknown>(cassettePath);
       if (saved.request) {
         const mismatch = defaultMatchHttpRequest(saved.request, incoming, options);
@@ -160,12 +254,17 @@ export const createVcrFetch = (
           });
         }
       }
-      const responseBody =
-        NULL_BODY_STATUSES.has(saved.status) || saved.body === undefined || saved.body === null
-          ? null
-          : typeof saved.body === 'string'
-            ? saved.body
-            : JSON.stringify(saved.body);
+      const resolvedPath = recorder.session.written.get(cassettePath) ?? cassettePath;
+      const body = readCassetteBody(saved, resolvedPath);
+      const responseBody: BodyInit | null = NULL_BODY_STATUSES.has(saved.status)
+        ? null
+        : body instanceof Uint8Array
+          ? new Uint8Array(body)
+          : body === undefined || body === null
+            ? null
+            : typeof body === 'string'
+              ? body
+              : JSON.stringify(body);
       return new Response(responseBody, {
         status: saved.status,
         headers: saved.headers ? { ...saved.headers } : undefined,
@@ -175,9 +274,32 @@ export const createVcrFetch = (
     recorder.session.spendLiveCall(`${recorder.service} http:${method}`);
     const started = Date.now();
     const response = await fetchImpl(input, init);
-    const text = await response.text();
+    const rawBuffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(rawBuffer);
+    const decoded = decodeBodyBytes(bytes, response.headers.get('content-type'));
     const headers = pickKeptHeaders(response.headers, keptResponseHeaders, recorder.scrubber);
-    const parsedBody = text.length === 0 ? null : recorder.scrubber.scrubValue(parseBodyText(text));
+
+    if (decoded.binary) {
+      await recorder.storeCassette<RecordedHttpRequest, unknown>(
+        cassettePath,
+        {
+          transport: 'http',
+          key: `${incoming.method} ${incoming.path}`,
+          request: incoming,
+          status: response.status,
+          headers,
+          binarySidecar: { data: decoded.bytes, extension: decoded.extension },
+        },
+        { transport: 'http', durationMs: Date.now() - started },
+      );
+      return new Response(NULL_BODY_STATUSES.has(response.status) ? null : rawBuffer, {
+        status: response.status,
+        headers: response.headers,
+      });
+    }
+
+    const parsedBody =
+      decoded.text.length === 0 ? null : recorder.scrubber.scrubValue(parseBodyText(decoded.text));
 
     await recorder.storeCassette<RecordedHttpRequest, unknown>(
       cassettePath,
@@ -192,7 +314,7 @@ export const createVcrFetch = (
       { transport: 'http', durationMs: Date.now() - started },
     );
 
-    return new Response(NULL_BODY_STATUSES.has(response.status) ? null : text, {
+    return new Response(NULL_BODY_STATUSES.has(response.status) ? null : decoded.text, {
       status: response.status,
       headers: response.headers,
     });
@@ -216,8 +338,8 @@ export const createHttpTransport = (
     new Headers(request.init?.headers).forEach((value, key) => {
       headers[key.toLowerCase()] = value;
     });
-    const body =
-      typeof request.init?.body === 'string' ? parseBodyText(request.init.body) : undefined;
+    const rawBody = decodeBodySource(request.init?.body);
+    const body = rawBody !== undefined ? parseBodyText(rawBody) : undefined;
     return {
       method: (request.init?.method ?? 'GET').toUpperCase(),
       path: `${parsed.pathname}${parsed.search}`,
@@ -239,10 +361,9 @@ export const createHttpTransport = (
       const scrubbedHeaders = request.init?.headers
         ? scrubber.scrubHeaders(new Headers(request.init.headers))
         : undefined;
+      const decodedBody = decodeBodySource(request.init?.body);
       const scrubbedBody =
-        typeof request.init?.body === 'string'
-          ? scrubber.scrubLine(request.init.body)
-          : request.init?.body;
+        decodedBody !== undefined ? scrubber.scrubLine(decodedBody) : request.init?.body;
       return {
         url: scrubbedUrl,
         ...(request.init
@@ -257,20 +378,22 @@ export const createHttpTransport = (
       };
     },
     scrubResponse(response, scrubber) {
-      return scrubber.scrubValue(response);
+      return response instanceof Uint8Array ? response : scrubber.scrubValue(response);
     },
     matchRequest(recorded, incoming) {
       return defaultMatchHttpRequest(toRecordedShape(recorded), toRecordedShape(incoming), options);
     },
     async executeLive(request) {
+      checkAborted(request.init?.signal);
       const response = await fetchImpl(request.url, request.init);
-      const text = await response.text();
-      const headers: Record<string, string> = {};
-      for (const name of keptResponseHeaders) {
-        const value = response.headers.get(name);
-        if (value !== null) headers[name.toLowerCase()] = value;
+      const rawBuffer = await response.arrayBuffer();
+      const bytes = new Uint8Array(rawBuffer);
+      const decoded = decodeBodyBytes(bytes, response.headers.get('content-type'));
+      const headers = extractKeptResponseHeaders(response.headers, keptResponseHeaders);
+      if (decoded.binary) {
+        return { status: response.status, headers, body: decoded.bytes };
       }
-      const body = text.length === 0 ? null : parseBodyText(text);
+      const body = decoded.text.length === 0 ? null : parseBodyText(decoded.text);
       return { status: response.status, headers, body };
     },
   });

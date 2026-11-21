@@ -40,6 +40,8 @@ export {
 export {
   type CliVersionOptions,
   compareVersions,
+  DEFAULT_CLI_VERSION_MAX_BUFFER,
+  DEFAULT_CLI_VERSION_TIMEOUT_MS,
   DEFAULT_SEMVER_PATTERN,
   fetchCliVersion,
   fetchHttpVersion,

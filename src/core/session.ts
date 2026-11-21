@@ -36,15 +36,17 @@ export const createVcrSession = (options: VcrSessionOptions = {}): VcrSession =>
   const versionCache = new Map<string, string>();
   const drift: DriftFinding[] = [];
   const written = new Map<string, string>();
+  const inFlightRecordOnce = new Map<string, Promise<void>>();
 
   const session: VcrSession = {
     versionCache,
     drift,
     written,
+    inFlightRecordOnce,
     liveCalls: 0,
     maxLiveCalls: options.maxLiveCalls ?? parseEnvMaxLive(),
     spendLiveCall(label: string): void {
-      const limit = options.maxLiveCalls ?? session.maxLiveCalls;
+      const limit = session.maxLiveCalls;
       if (++session.liveCalls > limit) {
         throw new VcrError(
           'live_budget_exceeded',
@@ -63,6 +65,7 @@ export const createVcrSession = (options: VcrSessionOptions = {}): VcrSession =>
       versionCache.clear();
       drift.length = 0;
       written.clear();
+      inFlightRecordOnce.clear();
       session.liveCalls = 0;
       session.maxLiveCalls = options.maxLiveCalls ?? parseEnvMaxLive();
     },

@@ -43,34 +43,64 @@
   },
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./scrub": {
-      "types": "./dist/scrub/index.d.ts",
-      "import": "./dist/scrub/index.js",
-      "require": "./dist/scrub/index.cjs"
+      "import": {
+        "types": "./dist/scrub/index.d.ts",
+        "default": "./dist/scrub/index.js"
+      },
+      "require": {
+        "types": "./dist/scrub/index.d.cts",
+        "default": "./dist/scrub/index.cjs"
+      }
     },
     "./http": {
-      "types": "./dist/http/index.d.ts",
-      "import": "./dist/http/index.js",
-      "require": "./dist/http/index.cjs"
+      "import": {
+        "types": "./dist/http/index.d.ts",
+        "default": "./dist/http/index.js"
+      },
+      "require": {
+        "types": "./dist/http/index.d.cts",
+        "default": "./dist/http/index.cjs"
+      }
     },
     "./process": {
-      "types": "./dist/process/index.d.ts",
-      "import": "./dist/process/index.js",
-      "require": "./dist/process/index.cjs"
+      "import": {
+        "types": "./dist/process/index.d.ts",
+        "default": "./dist/process/index.js"
+      },
+      "require": {
+        "types": "./dist/process/index.d.cts",
+        "default": "./dist/process/index.cjs"
+      }
     },
     "./websocket": {
-      "types": "./dist/websocket/index.d.ts",
-      "import": "./dist/websocket/index.js",
-      "require": "./dist/websocket/index.cjs"
+      "import": {
+        "types": "./dist/websocket/index.d.ts",
+        "default": "./dist/websocket/index.js"
+      },
+      "require": {
+        "types": "./dist/websocket/index.d.cts",
+        "default": "./dist/websocket/index.cjs"
+      }
     },
     "./freshness": {
-      "types": "./dist/freshness/index.d.ts",
-      "import": "./dist/freshness/index.js",
-      "require": "./dist/freshness/index.cjs"
+      "import": {
+        "types": "./dist/freshness/index.d.ts",
+        "default": "./dist/freshness/index.js"
+      },
+      "require": {
+        "types": "./dist/freshness/index.d.cts",
+        "default": "./dist/freshness/index.cjs"
+      }
     }
   },
   "devDependencies": {

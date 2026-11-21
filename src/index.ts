@@ -1,4 +1,5 @@
 export {
+  type BinarySidecarInput,
   clearVcrVersionCache,
   createVcrRecorder,
   createVcrSession,
@@ -45,6 +46,8 @@ export {
   compareSignatures,
   compareVersions,
   compareVolatileSignatures,
+  DEFAULT_CLI_VERSION_MAX_BUFFER,
+  DEFAULT_CLI_VERSION_TIMEOUT_MS,
   DEFAULT_ID_KEY_PATTERN,
   DEFAULT_SEMVER_PATTERN,
   DEFAULT_SIGNATURE_MAX_DEPTH,
@@ -129,9 +132,11 @@ export {
 } from './scrub/index';
 export {
   createVcrWebSocketFactory,
+  type SocketBinaryPayload,
   type SocketFrame,
   type SocketLike,
   type SocketSendData,
+  type SocketSentPayload,
   type SocketTranscript,
   type VcrSocketFactory,
   type WebSocketCassetteOptions,

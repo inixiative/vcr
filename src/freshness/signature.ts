@@ -21,6 +21,9 @@ export const DEFAULT_ID_KEY_PATTERN = /^[a-z]+_[A-Za-z0-9]{16,}$/;
 export const DEFAULT_VOLATILE_KINDS: readonly RegExp[] = [/^stderr$/];
 export const DEFAULT_VOLATILE_PATHS: readonly RegExp[] = [];
 
+const stripStatefulFlags = (pattern: RegExp): RegExp =>
+  new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, ''));
+
 const collectPaths = (
   value: unknown,
   maxDepth: number,
@@ -62,7 +65,8 @@ const collectPaths = (
     }
     ancestors.add(value);
     try {
-      const entries = Object.entries(value);
+      // Skip `undefined` values to match JSON.stringify serialization semantics (M1).
+      const entries = Object.entries(value).filter(([, child]) => child !== undefined);
       if (!entries.length && prefix) out.add(`${prefix}{}`);
       for (const [rawKey, child] of entries) {
         const key = idKeyPattern.test(rawKey) ? '<id>' : rawKey;
@@ -146,7 +150,7 @@ export const signatureOfCassette = (
   options: SignatureOptions = {},
 ): CassetteSignature => {
   const maxDepth = options.maxDepth ?? DEFAULT_SIGNATURE_MAX_DEPTH;
-  const idKeyPattern = options.idKeyPattern ?? DEFAULT_ID_KEY_PATTERN;
+  const idKeyPattern = stripStatefulFlags(options.idKeyPattern ?? DEFAULT_ID_KEY_PATTERN);
   const resolveEventKind = options.eventKindOf ?? eventKindOf;
 
   const shape: Record<string, Set<string>> = {};
@@ -222,11 +226,8 @@ const diffShapeEntries = (
   return differences;
 };
 
-const isVolatileKind = (kind: string, patterns: readonly RegExp[]): boolean =>
-  patterns.some((pattern) => pattern.test(kind));
-
-const isVolatilePath = (path: string, patterns: readonly RegExp[]): boolean =>
-  patterns.some((pattern) => pattern.test(path));
+const isMatchAny = (value: string, patterns: readonly RegExp[]): boolean =>
+  patterns.some((pattern) => pattern.test(value));
 
 /** Returns human-readable structural drift between two signatures, excluding configured volatile kinds/paths. */
 export const compareSignatures = (
@@ -234,15 +235,15 @@ export const compareSignatures = (
   after: CassetteSignature,
   options: SignatureOptions = {},
 ): string[] => {
-  const volatileKinds = options.volatileKinds ?? DEFAULT_VOLATILE_KINDS;
-  const volatilePaths = options.volatilePaths ?? DEFAULT_VOLATILE_PATHS;
+  const volatileKinds = (options.volatileKinds ?? DEFAULT_VOLATILE_KINDS).map(stripStatefulFlags);
+  const volatilePaths = (options.volatilePaths ?? DEFAULT_VOLATILE_PATHS).map(stripStatefulFlags);
   return [
     ...(before.status !== after.status ? [`status ${before.status} -> ${after.status}`] : []),
     ...diffShapeEntries(
       before,
       after,
-      (kind) => !isVolatileKind(kind, volatileKinds),
-      (path) => !isVolatilePath(path, volatilePaths),
+      (kind) => !isMatchAny(kind, volatileKinds),
+      (path) => !isMatchAny(path, volatilePaths),
     ),
   ];
 };
@@ -253,15 +254,15 @@ export const compareVolatileSignatures = (
   after: CassetteSignature,
   options: SignatureOptions = {},
 ): string[] => {
-  const volatileKinds = options.volatileKinds ?? DEFAULT_VOLATILE_KINDS;
-  const volatilePaths = options.volatilePaths ?? DEFAULT_VOLATILE_PATHS;
+  const volatileKinds = (options.volatileKinds ?? DEFAULT_VOLATILE_KINDS).map(stripStatefulFlags);
+  const volatilePaths = (options.volatilePaths ?? DEFAULT_VOLATILE_PATHS).map(stripStatefulFlags);
   return [
-    ...diffShapeEntries(before, after, (kind) => isVolatileKind(kind, volatileKinds)),
+    ...diffShapeEntries(before, after, (kind) => isMatchAny(kind, volatileKinds)),
     ...diffShapeEntries(
       before,
       after,
-      (kind) => !isVolatileKind(kind, volatileKinds),
-      (path) => isVolatilePath(path, volatilePaths),
+      (kind) => !isMatchAny(kind, volatileKinds),
+      (path) => isMatchAny(path, volatilePaths),
     ),
   ];
 };

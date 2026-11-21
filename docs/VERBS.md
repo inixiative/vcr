@@ -96,19 +96,22 @@ Constants: `jsonRpcLineProtocol`.
 | assert | `assertCassettesFresh` | Throws `VcrError('stale_cassette')` listing all findings if any cassette under a fixtures directory fails freshness checks. |
 
 Constants: `DEFAULT_SIGNATURE_MAX_DEPTH`, `DEFAULT_ID_KEY_PATTERN`, `DEFAULT_VOLATILE_KINDS`,
-`DEFAULT_VOLATILE_PATHS`, `DEFAULT_SEMVER_PATTERN`, `PENDING_CASSETTE_SUFFIX`, `POLICY_FILENAME`.
+`DEFAULT_VOLATILE_PATHS`, `DEFAULT_SEMVER_PATTERN`, `DEFAULT_CLI_VERSION_TIMEOUT_MS`,
+`DEFAULT_CLI_VERSION_MAX_BUFFER`, `PENDING_CASSETTE_SUFFIX`, `POLICY_FILENAME`.
 
 ## Exported Types
 
 `VcrErrorCode`, `VcrErrorDetails`, `VcrMode`, `VcrRecordingStamp`, `VcrEntry`, `VcrCassette`,
 `VcrResponse`, `VcrMethodSanitizer`, `VcrVersionResolver`, `DriftFinding`, `VcrLiveResult`,
 `VcrTransport`, `VcrSessionOptions`, `VcrRecorderOptions`, `ResolveModeOptions`,
-`StoreCassetteInput`, `VcrSession`, `ScrubPlaceholderKind`, `ScrubPlaceholderResolver`, `ScrubRule`,
-`ScrubContext`, `ScrubOptions`, `LeakFinding`, `HeaderInput`, `Scrubber`, `BuiltInSecretDetector`,
-`RecordedHttpRequest`, `HttpCassette`, `HttpCassetteOptions`, `HttpTransportRequest`,
-`ProcessFrame`, `ProcessTranscript`, `ProcessSpawnOptions`, `RecordedProcess`, `ProcessLaunch`,
-`ProcessLineProtocolSession`, `ProcessLineProtocol`, `ProcessCassetteOptions`, `VcrProcessSpawner`,
-`SocketFrame`, `SocketTranscript`, `SocketLike`, `SocketSendData`, `VcrSocketFactory`, `WebSocketCassetteOptions`,
-`CassetteSignature`, `SignatureOptions`, `AcceptedDrift`, `FetchCassettePathsOptions`,
-`CliVersionOptions`, `HttpVersionOptions`, `FreshnessPolicy`, `FreshnessFindingCode`,
-`FreshnessFinding`, `CassetteValidationResult`, `CheckFreshnessOptions`, `BlessPolicyOptions`.
+`BinarySidecarInput`, `StoreCassetteInput`, `VcrSession`, `ScrubPlaceholderKind`,
+`ScrubPlaceholderResolver`, `ScrubRule`, `ScrubContext`, `ScrubOptions`, `LeakFinding`,
+`HeaderInput`, `Scrubber`, `BuiltInSecretDetector`, `RecordedHttpRequest`, `HttpCassette`,
+`HttpCassetteOptions`, `HttpTransportRequest`, `ProcessFrame`, `ProcessTranscript`,
+`ProcessSpawnOptions`, `RecordedProcess`, `ProcessLaunch`, `ProcessLineProtocolSession`,
+`ProcessLineProtocol`, `ProcessCassetteOptions`, `VcrProcessSpawner`, `SocketFrame`,
+`SocketBinaryPayload`, `SocketSentPayload`, `SocketTranscript`, `SocketLike`, `SocketSendData`,
+`VcrSocketFactory`, `WebSocketCassetteOptions`, `CassetteSignature`, `SignatureOptions`,
+`AcceptedDrift`, `FetchCassettePathsOptions`, `CliVersionOptions`, `HttpVersionOptions`,
+`FreshnessPolicy`, `FreshnessFindingCode`, `FreshnessFinding`, `CassetteValidationResult`,
+`CheckFreshnessOptions`, `BlessPolicyOptions`.

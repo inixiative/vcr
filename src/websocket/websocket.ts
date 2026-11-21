@@ -5,18 +5,27 @@ export interface SocketFrame {
   readonly after: number;
   readonly stream: 'in';
   readonly data: string;
+  readonly encoding?: 'utf8' | 'base64';
 }
+
+export interface SocketBinaryPayload {
+  readonly encoding: 'base64';
+  readonly data: string;
+}
+
+export type SocketSentPayload = string | SocketBinaryPayload;
 
 export interface SocketTranscript {
   readonly kind: 'websocket';
   readonly path: string;
-  readonly sent: string[];
+  readonly sent: SocketSentPayload[];
   readonly frames: SocketFrame[];
   exit: {
     readonly after: number;
     readonly code: number;
     readonly reason: string;
     readonly by: 'client' | 'server';
+    readonly wasClean?: boolean;
   };
 }
 
@@ -37,15 +46,44 @@ export type VcrSocketFactory = (url: string | URL, protocols?: string | string[]
 export interface WebSocketCassetteOptions {
   /** Custom underlying WebSocket factory used when recording live. */
   readonly socketImpl?: VcrSocketFactory;
-  /** Optional normalizer applied to scrubbed outbound frames before replay comparison. */
+  /** Optional normalizer applied to scrubbed outbound text frames before replay comparison. */
   readonly normalizeSentFrame?: (frame: string) => string;
 }
 
-const decodePayload = (data: unknown): string => {
-  if (typeof data === 'string') return data;
-  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
-  if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data);
-  return String(data);
+const isValidClientCloseCode = (code: number): boolean =>
+  code === 1000 || (code >= 3000 && code <= 4999);
+
+const assertValidCloseCode = (code: number | undefined): void => {
+  if (code !== undefined && !isValidClientCloseCode(code)) {
+    throw new RangeError(
+      `Invalid WebSocket close code ${code}: must be 1000 or in the range 3000–4999`,
+    );
+  }
+};
+
+const createCloseEvent = (code: number, reason: string, wasClean: boolean): CloseEvent => {
+  if (typeof CloseEvent !== 'undefined') {
+    return new CloseEvent('close', { code, reason, wasClean });
+  }
+  return Object.assign(new Event('close'), { code, reason, wasClean }) as CloseEvent;
+};
+
+const toBytes = (data: ArrayBuffer | ArrayBufferView): Uint8Array =>
+  data instanceof ArrayBuffer
+    ? new Uint8Array(data)
+    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+
+const encodeBinaryBase64 = (data: ArrayBuffer | ArrayBufferView): string =>
+  Buffer.from(toBytes(data)).toString('base64');
+
+const decodeBinaryBase64 = (encoded: string): ArrayBuffer => {
+  const buf = Buffer.from(encoded, 'base64');
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+};
+
+const serializeSentPayload = (data: SocketSendData, recorder: VcrRecorder): SocketSentPayload => {
+  if (typeof data === 'string') return recorder.scrubber.scrubLine(data);
+  return { encoding: 'base64', data: encodeBinaryBase64(data) };
 };
 
 const defaultSocketImpl: VcrSocketFactory = (url, protocols) => new WebSocket(url, protocols);
@@ -68,31 +106,55 @@ const recordWebSocket = (
     path: recorder.scrubber.scrubUrl(`${parsedUrl.pathname}${parsedUrl.search}`),
     sent: [],
     frames: [],
-    exit: { after: 0, code: 1005, reason: '', by: 'server' },
+    exit: { after: 0, code: 1005, reason: '', by: 'server', wasClean: false },
   };
   let closingByClient = false;
 
-  socket.addEventListener('message', (event) => {
+  const onMessage = (event: Event): void => {
     const messageEvent = event as MessageEvent;
+    const raw = messageEvent.data;
+    if (typeof raw === 'string') {
+      transcript.frames.push({
+        after: transcript.sent.length,
+        stream: 'in',
+        data: recorder.scrubber.scrubLine(raw),
+      });
+      return;
+    }
+    if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
+      transcript.frames.push({
+        after: transcript.sent.length,
+        stream: 'in',
+        encoding: 'base64',
+        data: encodeBinaryBase64(raw),
+      });
+      return;
+    }
     transcript.frames.push({
       after: transcript.sent.length,
       stream: 'in',
-      data: recorder.scrubber.scrubLine(decodePayload(messageEvent.data)),
+      data: recorder.scrubber.scrubLine(String(raw)),
     });
-  });
+  };
+
+  socket.addEventListener('message', onMessage);
 
   recorder.trackPendingWrite(
     new Promise<void>((resolve) => {
-      socket.addEventListener('close', (event) => {
+      const onClose = (event: Event): void => {
+        socket.removeEventListener('message', onMessage);
+        socket.removeEventListener('close', onClose);
         const closeEvent = event as CloseEvent;
         transcript.exit = {
           after: transcript.sent.length,
           code: closeEvent.code,
           reason: recorder.scrubber.scrubText(closeEvent.reason),
           by: closingByClient ? 'client' : 'server',
+          wasClean: Boolean(closeEvent.wasClean),
         };
         resolve();
-      });
+      };
+      socket.addEventListener('close', onClose);
     }).then(() =>
       recorder.storeCassette(
         cassettePath,
@@ -107,12 +169,15 @@ const recordWebSocket = (
 
   return Object.assign(socket, {
     send(data: SocketSendData): void {
-      transcript.sent.push(recorder.scrubber.scrubLine(decodePayload(data)));
+      transcript.sent.push(serializeSentPayload(data, recorder));
       originalSend(data);
     },
     close(code?: number, reason?: string): void {
+      assertValidCloseCode(code);
       closingByClient = true;
-      originalClose(code, reason);
+      if (code === undefined) originalClose();
+      else if (reason === undefined) originalClose(code);
+      else originalClose(code, reason);
     },
   });
 };
@@ -158,12 +223,33 @@ class ReplayWebSocket extends EventTarget implements SocketLike {
         { cassette: this.cassettePath },
       );
     }
-    const normalize = this.normalizeSentFrame ?? ((value: string) => value);
-    const incoming = this.recorder.scrubber.scrubLine(decodePayload(data));
-    if (normalize(incoming) !== normalize(recorded)) {
+    const incoming = serializeSentPayload(data, this.recorder);
+    if (typeof recorded === 'string' && typeof incoming === 'string') {
+      const normalize = this.normalizeSentFrame ?? ((value: string) => value);
+      if (normalize(incoming) !== normalize(recorded)) {
+        throw new VcrError(
+          'request_mismatch',
+          `VCR replay (websocket): send #${this.sentCount + 1} differs from the recording`,
+          { cassette: this.cassettePath },
+        );
+      }
+    } else if (
+      typeof recorded === 'object' &&
+      typeof incoming === 'object' &&
+      recorded.encoding === 'base64' &&
+      incoming.encoding === 'base64'
+    ) {
+      if (recorded.data !== incoming.data) {
+        throw new VcrError(
+          'request_mismatch',
+          `VCR replay (websocket): binary send #${this.sentCount + 1} differs from the recording`,
+          { cassette: this.cassettePath },
+        );
+      }
+    } else {
       throw new VcrError(
         'request_mismatch',
-        `VCR replay (websocket): send #${this.sentCount + 1} differs from the recording`,
+        `VCR replay (websocket): send #${this.sentCount + 1} frame type differs from the recording`,
         { cassette: this.cassettePath },
       );
     }
@@ -171,9 +257,10 @@ class ReplayWebSocket extends EventTarget implements SocketLike {
     this.releaseDueFrames();
   }
 
-  close(code = 1000, reason = ''): void {
+  close(code?: number, reason = ''): void {
+    assertValidCloseCode(code);
     if (this.readyState >= WebSocket.CLOSING) return;
-    this.finish(code, reason);
+    this.finish(code ?? 1000, reason, true);
   }
 
   private releaseDueFrames(): void {
@@ -182,7 +269,9 @@ class ReplayWebSocket extends EventTarget implements SocketLike {
         const frame = this.transcript.frames[this.nextFrame];
         if (!frame || frame.after > this.sentCount) break;
         this.nextFrame++;
-        this.fireEvent('message', new MessageEvent('message', { data: frame.data }));
+        const payload: string | ArrayBuffer =
+          frame.encoding === 'base64' ? decodeBinaryBase64(frame.data) : frame.data;
+        this.fireEvent('message', new MessageEvent('message', { data: payload }));
       }
       const exit = this.transcript.exit;
       if (
@@ -191,14 +280,14 @@ class ReplayWebSocket extends EventTarget implements SocketLike {
         this.nextFrame >= this.transcript.frames.length &&
         this.sentCount >= exit.after
       ) {
-        this.finish(exit.code, exit.reason);
+        this.finish(exit.code, exit.reason, exit.wasClean ?? true);
       }
     });
   }
 
-  private finish(code: number, reason: string): void {
+  private finish(code: number, reason: string, wasClean: boolean): void {
     this.readyState = WebSocket.CLOSED;
-    this.fireEvent('close', new CloseEvent('close', { code, reason, wasClean: true }));
+    this.fireEvent('close', createCloseEvent(code, reason, wasClean));
   }
 
   private fireEvent(type: 'open' | 'message' | 'close', event: Event): void {
@@ -223,6 +312,15 @@ export const createVcrWebSocketFactory = (
           'invalid_cassette',
           `VCR replay (websocket): cassette "${cassettePath}" does not contain a websocket transcript`,
           { cassette: cassettePath },
+        );
+      }
+      const parsedUrl = new URL(String(url));
+      const incomingPath = recorder.scrubber.scrubUrl(`${parsedUrl.pathname}${parsedUrl.search}`);
+      if (saved.body.path !== incomingPath) {
+        throw new VcrError(
+          'request_mismatch',
+          `VCR replay (websocket): path "${incomingPath}" was recorded as "${saved.body.path}"`,
+          { cassette: cassettePath, details: { recordedPath: saved.body.path, incomingPath } },
         );
       }
       return new ReplayWebSocket(recorder, cassettePath, saved.body, options.normalizeSentFrame);

@@ -1,10 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { VcrError } from '../core/errors';
+import {
+  assertSafePathSegment,
+  PENDING_CASSETTE_SUFFIX,
+  POLICY_FILENAME,
+  writeFileAtomic,
+} from '../core/fs-utils';
 import type { VcrCassette } from '../core/types';
-import { createScrubber } from '../scrub/scrubber';
+import { resolveScrubber } from '../scrub/scrubber';
 import type { Scrubber, ScrubOptions } from '../scrub/types';
-import { fetchCassettePaths, PENDING_CASSETTE_SUFFIX, POLICY_FILENAME } from './pending';
+import { fetchCassettePaths } from './pending';
 import { compareVersions } from './versions';
 
 export interface FreshnessPolicy {
@@ -55,14 +61,11 @@ export interface BlessPolicyOptions {
 
 const MS_PER_DAY = 86_400_000;
 
-const isScrubberHandle = (value: Scrubber | ScrubOptions | undefined): value is Scrubber =>
-  Boolean(value && typeof value === 'object' && 'findUnscrubbedSecrets' in value);
-
 /** Returns the path to `policy.json` inside `fixturesDir`. */
 export const policyPathForDirectory = (fixturesDir: string): string =>
   join(fixturesDir, POLICY_FILENAME);
 
-/** Reads and parses `<fixturesDir>/policy.json`. */
+/** Reads and validates `<fixturesDir>/policy.json`. */
 export const fetchFreshnessPolicy = (fixturesDir: string): FreshnessPolicy => {
   const filePath = policyPathForDirectory(fixturesDir);
   if (!existsSync(filePath)) {
@@ -83,27 +86,48 @@ export const fetchFreshnessPolicy = (fixturesDir: string): FreshnessPolicy => {
       },
     );
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new VcrError(
+      'invalid_cassette',
+      `VCR: freshness policy "${filePath}" must be a JSON object`,
+      { cassette: filePath },
+    );
+  }
+  const obj = parsed as { maxAgeDays?: unknown; blessed?: unknown };
   if (
-    !parsed ||
-    typeof parsed !== 'object' ||
-    typeof (parsed as { maxAgeDays?: unknown }).maxAgeDays !== 'number' ||
-    !(parsed as { blessed?: unknown }).blessed ||
-    typeof (parsed as { blessed?: unknown }).blessed !== 'object'
+    typeof obj.maxAgeDays !== 'number' ||
+    !Number.isFinite(obj.maxAgeDays) ||
+    obj.maxAgeDays < 0
   ) {
     throw new VcrError(
       'invalid_cassette',
-      `VCR: freshness policy "${filePath}" must contain numeric "maxAgeDays" and object "blessed"`,
+      `VCR: freshness policy "${filePath}" must contain a finite non-negative "maxAgeDays"`,
       { cassette: filePath },
     );
+  }
+  if (!obj.blessed || typeof obj.blessed !== 'object' || Array.isArray(obj.blessed)) {
+    throw new VcrError(
+      'invalid_cassette',
+      `VCR: freshness policy "${filePath}" must contain a plain object "blessed"`,
+      { cassette: filePath },
+    );
+  }
+  for (const [key, value] of Object.entries(obj.blessed as Record<string, unknown>)) {
+    if (typeof value !== 'string' || !value) {
+      throw new VcrError(
+        'invalid_cassette',
+        `VCR: freshness policy "${filePath}" has non-string blessed version for "${key}"`,
+        { cassette: filePath },
+      );
+    }
   }
   return parsed as FreshnessPolicy;
 };
 
-/** Writes a `FreshnessPolicy` to `<fixturesDir>/policy.json`. */
+/** Writes a `FreshnessPolicy` atomically to `<fixturesDir>/policy.json`. */
 export const writeFreshnessPolicy = (fixturesDir: string, policy: FreshnessPolicy): void => {
   const filePath = policyPathForDirectory(fixturesDir);
-  mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, `${JSON.stringify(policy, null, 2)}\n`);
+  writeFileAtomic(filePath, `${JSON.stringify(policy, null, 2)}\n`);
 };
 
 /** Raises `policy.blessed` versions to match the newest committed cassettes under `fixturesDir`. */
@@ -164,8 +188,16 @@ export const validateCassette = (raw: unknown): CassetteValidationResult => {
   ) {
     errors.push('"headers" must be an object when present');
   }
-  if (obj.bodyFile !== undefined && typeof obj.bodyFile !== 'string') {
-    errors.push('"bodyFile" must be a string when present');
+  if (obj.bodyFile !== undefined) {
+    if (typeof obj.bodyFile !== 'string') {
+      errors.push('"bodyFile" must be a string when present');
+    } else {
+      try {
+        assertSafePathSegment(obj.bodyFile, 'bodyFile');
+      } catch {
+        errors.push('"bodyFile" must be a safe filename without path traversal');
+      }
+    }
   }
   if (obj.entries !== undefined && !Array.isArray(obj.entries)) {
     errors.push('"entries" must be an array when present');
@@ -193,9 +225,7 @@ export const checkCassetteFreshness = (
 ): FreshnessFinding[] => {
   const policy = options.policy ?? fetchFreshnessPolicy(fixturesDir);
   const now = options.now ?? Date.now();
-  const scrubber = isScrubberHandle(options.scrubber)
-    ? options.scrubber
-    : createScrubber(options.scrubber);
+  const scrubber = resolveScrubber(options.scrubber);
 
   const findings: FreshnessFinding[] = [];
   for (const filePath of fetchCassettePaths(fixturesDir, { includePending: true })) {
