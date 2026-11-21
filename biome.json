@@ -1,0 +1,14 @@
+{
+  "extends": ["@inixiative/config/biome/base.json"],
+  "linter": {
+    "rules": {
+      "suspicious": {
+        "noExplicitAny": "error",
+        "noImplicitAnyLet": "error"
+      },
+      "style": {
+        "noNonNullAssertion": "error"
+      }
+    }
+  }
+}

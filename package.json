@@ -1,0 +1,85 @@
+{
+  "name": "@inixiative/vcr",
+  "version": "0.1.0",
+  "description": "Zero-dependency deterministic cassette recorder, replayer, secret scrubber, structural drift guard, and freshness verifier for HTTP, WebSocket, child processes, and custom transports.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "check": "bun run typecheck && bun run lint && bun run test",
+    "prepublishOnly": "bun run check && bun run build"
+  },
+  "keywords": [
+    "vcr",
+    "cassette",
+    "replay",
+    "record",
+    "testing",
+    "scrub",
+    "redaction",
+    "sanitization",
+    "drift",
+    "inixiative"
+  ],
+  "author": "Aron Greenspan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inixiative/vcr.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./scrub": {
+      "types": "./dist/scrub/index.d.ts",
+      "import": "./dist/scrub/index.js",
+      "require": "./dist/scrub/index.cjs"
+    },
+    "./http": {
+      "types": "./dist/http/index.d.ts",
+      "import": "./dist/http/index.js",
+      "require": "./dist/http/index.cjs"
+    },
+    "./process": {
+      "types": "./dist/process/index.d.ts",
+      "import": "./dist/process/index.js",
+      "require": "./dist/process/index.cjs"
+    },
+    "./websocket": {
+      "types": "./dist/websocket/index.d.ts",
+      "import": "./dist/websocket/index.js",
+      "require": "./dist/websocket/index.cjs"
+    },
+    "./freshness": {
+      "types": "./dist/freshness/index.d.ts",
+      "import": "./dist/freshness/index.js",
+      "require": "./dist/freshness/index.cjs"
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.2",
+    "@inixiative/config": "^0.5.237",
+    "@types/bun": "1.4.4",
+    "@types/node": "^25.3.5",
+    "tsup": "8.5.1",
+    "typescript": "6.0.3"
+  },
+  "packageManager": "bun@1.4.4"
+}

@@ -1,0 +1,35 @@
+export {
+  BUILT_IN_SECRET_DETECTORS,
+  type BuiltInSecretDetector,
+  DEFAULT_IDENTITY_KEY_PATTERN,
+  DEFAULT_PLACEHOLDERS,
+  DEFAULT_SECRET_HEADERS,
+  DEFAULT_SECRET_KEY_PATTERN,
+  DEFAULT_SECRET_QUERY_PARAMS,
+  defaultPlaceholderFor,
+  REDACTED_EMAIL,
+  REDACTED_IP,
+  REDACTED_UUID,
+} from './patterns';
+export {
+  accountHomeDirectory,
+  assertScrubbed,
+  createScrubber,
+  findUnscrubbedSecrets,
+  rehydratePlaceholders,
+  scrubHeaders,
+  scrubLine,
+  scrubText,
+  scrubUrl,
+  scrubValue,
+} from './scrubber';
+export type {
+  HeaderInput,
+  LeakFinding,
+  Scrubber,
+  ScrubContext,
+  ScrubOptions,
+  ScrubPlaceholderKind,
+  ScrubPlaceholderResolver,
+  ScrubRule,
+} from './types';
