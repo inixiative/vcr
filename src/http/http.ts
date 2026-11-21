@@ -173,6 +173,13 @@ const checkAborted = (signal: AbortSignal | null | undefined): void => {
   throw signal.reason ?? new DOMException('The operation was aborted.', 'AbortError');
 };
 
+const scrubUrlSearchParams = (params: URLSearchParams, scrubber: Scrubber): string => {
+  const query = params.toString();
+  if (!query) return '';
+  const scrubbed = scrubber.scrubUrl(`/?${query}`);
+  return scrubbed.startsWith('/?') ? scrubbed.slice(2) : scrubbed.slice(1);
+};
+
 /** Normalizes and scrubs an HTTP fetch input + init pair into a deterministic `RecordedHttpRequest`. */
 export const describeHttpRequest = async (
   input: string | URL | Request,
@@ -186,7 +193,11 @@ export const describeHttpRequest = async (
   const headers = scrubber.scrubHeaders(new Headers(init?.headers ?? request?.headers));
   const rawBodyText = await extractBodyText(input, init);
   const parsedBody =
-    rawBodyText !== undefined ? scrubber.scrubValue(parseBodyText(rawBodyText)) : undefined;
+    init?.body instanceof URLSearchParams
+      ? scrubUrlSearchParams(init.body, scrubber)
+      : rawBodyText !== undefined
+        ? scrubber.scrubValue(parseBodyText(rawBodyText))
+        : undefined;
   const scrubbedPath = scrubber.scrubUrl(`${url.pathname}${url.search}`);
   return {
     method: (init?.method ?? request?.method ?? 'GET').toUpperCase(),
@@ -363,7 +374,11 @@ export const createHttpTransport = (
         : undefined;
       const decodedBody = decodeBodySource(request.init?.body);
       const scrubbedBody =
-        decodedBody !== undefined ? scrubber.scrubLine(decodedBody) : request.init?.body;
+        request.init?.body instanceof URLSearchParams
+          ? scrubUrlSearchParams(request.init.body, scrubber)
+          : decodedBody !== undefined
+            ? scrubber.scrubLine(decodedBody)
+            : request.init?.body;
       return {
         url: scrubbedUrl,
         ...(request.init

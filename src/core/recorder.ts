@@ -567,7 +567,16 @@ export class VcrRecorder {
     if (this.drifted) return { target: pendingPath, targetRoot };
     if (!existsSync(cassettePath)) return { target: out, targetRoot };
 
-    const committed = JSON.parse(readFileSync(cassettePath, 'utf8')) as VcrCassette;
+    let committed: VcrCassette;
+    try {
+      committed = JSON.parse(readFileSync(cassettePath, 'utf8')) as VcrCassette;
+    } catch (error) {
+      throw new VcrError(
+        'invalid_cassette',
+        `VCR: committed cassette "${basename(cassettePath)}" contains invalid JSON`,
+        { cassette: cassettePath, cause: error },
+      );
+    }
     const differences = compareSignatures(
       signatureForCassette(committed, this.signatureOptions),
       signatureForCassette(next, this.signatureOptions),

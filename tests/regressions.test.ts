@@ -13,7 +13,7 @@ import {
   fetchFreshnessPolicy,
   signatureOfCassette,
 } from '../src/freshness/index';
-import { createHttpTransport, createVcrFetch } from '../src/http/index';
+import { createHttpTransport, createVcrFetch, describeHttpRequest } from '../src/http/index';
 import { createVcrProcessSpawner } from '../src/process/index';
 import {
   assertScrubbed,
@@ -25,7 +25,7 @@ import {
   scrubUrl,
   scrubValue,
 } from '../src/scrub/index';
-import { createVcrWebSocketFactory } from '../src/websocket/index';
+import { createVcrWebSocketFactory, type SocketLike } from '../src/websocket/index';
 
 let dir: string;
 let outsideDir: string;
@@ -624,5 +624,120 @@ describe('MEDIUM & LOW regressions (M1–M8, L1–L4)', () => {
     expect(() => fetchFreshnessPolicy(dir)).toThrow('finite non-negative');
     writeFileSync(join(dir, 'policy.json'), JSON.stringify({ maxAgeDays: 7, blessed: [] }));
     expect(() => fetchFreshnessPolicy(dir)).toThrow('plain object');
+  });
+
+  test('follow-up M1: WebSocket records Node 22 Blob binary frames in causal order and replays exact bytes', async () => {
+    const blobBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+
+    class FakeBlobSocket extends EventTarget implements SocketLike {
+      readyState: number = WebSocket.OPEN;
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      onerror: ((event: ErrorEvent) => void) | null = null;
+
+      send(): void {
+        // Emit a Blob binary frame followed immediately by a text frame to verify causal ordering!
+        const blobEvent = new MessageEvent('message', { data: new Blob([blobBytes]) });
+        this.dispatchEvent(blobEvent);
+        this.onmessage?.(blobEvent);
+
+        const textEvent = new MessageEvent('message', { data: '{"step":"after-blob"}' });
+        this.dispatchEvent(textEvent);
+        this.onmessage?.(textEvent);
+      }
+
+      close(code = 1000, reason = ''): void {
+        this.readyState = WebSocket.CLOSED;
+        const closeEvent = new CloseEvent('close', { code, reason, wasClean: true });
+        this.dispatchEvent(closeEvent);
+        this.onclose?.(closeEvent);
+      }
+    }
+
+    const session = createVcrSession();
+    const rec = createVcrRecorder(dir, {
+      service: 'wsblob',
+      version: '1.0.0',
+      mode: 'record',
+      session,
+    }).queue('ws', 'blob');
+
+    const liveSocket = createVcrWebSocketFactory(rec, 'ws', {
+      socketImpl: () => new FakeBlobSocket(),
+    })('ws://example.invalid/blob');
+    liveSocket.send('go');
+    liveSocket.close(1000, 'done');
+    await rec.waitUntilSettled();
+
+    // Replay must deliver the binary ArrayBuffer first, then the text frame!
+    const rep = createVcrRecorder(dir, {
+      service: 'wsblob',
+      version: '1.0.0',
+      mode: 'replay',
+      session,
+    }).queue('ws', 'blob');
+    const replaySocket = createVcrWebSocketFactory(rep, 'ws')('ws://unused.invalid/blob');
+    const frames: Array<ArrayBuffer | string> = [];
+    await new Promise<void>((resolve) => {
+      replaySocket.onopen = () => replaySocket.send('go');
+      replaySocket.onmessage = (ev) => {
+        frames.push(ev.data as ArrayBuffer | string);
+        if (frames.length === 2) resolve();
+      };
+    });
+
+    expect(frames[0]).toBeInstanceOf(ArrayBuffer);
+    expect(
+      Buffer.from(new Uint8Array(frames[0] as ArrayBuffer)).equals(Buffer.from(blobBytes)),
+    ).toBe(true);
+    expect(frames[1]).toBe('{"step":"after-blob"}');
+  });
+
+  test('follow-up M2: scrubs camelCase/unseparated inline secrets, stops before &, stays < 5ms on 20KB, and scrubs URLSearchParams forms', async () => {
+    expect(
+      scrubText(
+        'apiKey=secretvalue1 accessToken=secretvalue2 MYSECRET=secretvalue3 password=longpass12&page=1',
+      ),
+    ).toBe(
+      'apiKey=<REDACTED:SECRET> accessToken=<REDACTED:SECRET> MYSECRET=<REDACTED:SECRET> password=<REDACTED:SECRET>&page=1',
+    );
+
+    // Performance: 20 KB non-matching input stays strictly linear (< 5ms)
+    const bigInput = `${'A'.repeat(20_000)}!`;
+    const start = performance.now();
+    expect(scrubText(bigInput)).toBe(bigInput);
+    expect(performance.now() - start).toBeLessThan(5);
+
+    // URLSearchParams with short secret value (4 chars) + non-secret field
+    const form = new URLSearchParams({ password: '1234', page: '1' });
+    const scrubber = createScrubber();
+    const described = await describeHttpRequest(
+      'https://api.example.com/login',
+      { method: 'POST', body: form },
+      scrubber,
+    );
+    expect(described.body).toBe('page=1&password=<REDACTED:QUERY_SECRET>');
+
+    const transport = createHttpTransport();
+    const scrubbedReq = transport.scrubRequest(
+      { url: 'https://api.example.com/login', init: { method: 'POST', body: form } },
+      scrubber,
+    );
+    expect(scrubbedReq.init?.body).toBe('page=1&password=<REDACTED:QUERY_SECRET>');
+  });
+
+  test('follow-up L1: resolveTargetPath wraps invalid committed cassette JSON in VcrError(invalid_cassette)', async () => {
+    writeFileSync(join(dir, 'corrupt.x.json'), '{not-valid-json');
+    const rec = createVcrRecorder(dir, {
+      service: 'corrupt',
+      version: '1.0.0',
+      mode: 'record',
+      session: createVcrSession(),
+    }).queue('corrupt', 'x');
+
+    await expect(rec.capture('corrupt', async () => ({ ok: true }))).rejects.toMatchObject({
+      code: 'invalid_cassette',
+    });
   });
 });

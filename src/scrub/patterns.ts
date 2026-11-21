@@ -212,9 +212,9 @@ export const BUILT_IN_SECRET_DETECTORS: readonly BuiltInSecretDetector[] = [
   },
 ];
 
-// Bounded + negative lookbehind for O(n) execution; matches uppercase/lowercase env and config assignments.
+// Bounded + negative lookbehind for O(n) execution; matches camelCase, snake_case, and uppercase env/config assignments without crossing `&`.
 export const INLINE_ENV_SECRET_PATTERN =
-  /(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]{1,32}[_-]){0,4}(?:key|secret|token|password|passwd)(?:[_-][A-Za-z0-9]{1,32}){0,2})\s*[=:]\s*)(["']?)(?!<REDACTED:|REDACTED\b)([^\s"',}]{8,})\2/gi;
+  /(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{0,40}(?:key|secret|token|password|passwd)[A-Za-z0-9_-]{0,24}\s*[=:]\s*)(["']?)(?!<REDACTED:|REDACTED\b)([^\s"',}&]{8,})\2/gi;
 
 export const SAFE_PLACEHOLDER_PATTERN =
   /^(?:<REDACTED(?::[A-Z0-9_-]+)?>|(?:Bearer|Basic|DPoP|FlyV1)\s+<REDACTED(?::[A-Z0-9_-]+)?>|REDACTED|MASKED|00000000-0000-4000-8000-000000000000|redacted@example\.invalid)$/i;

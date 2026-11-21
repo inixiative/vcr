@@ -109,6 +109,7 @@ const recordWebSocket = (
     exit: { after: 0, code: 1005, reason: '', by: 'server', wasClean: false },
   };
   let closingByClient = false;
+  const pendingFrameReads: Promise<void>[] = [];
 
   const onMessage = (event: Event): void => {
     const messageEvent = event as MessageEvent;
@@ -128,6 +129,26 @@ const recordWebSocket = (
         encoding: 'base64',
         data: encodeBinaryBase64(raw),
       });
+      return;
+    }
+    if (typeof Blob !== 'undefined' && raw instanceof Blob) {
+      const frame: {
+        readonly after: number;
+        readonly stream: 'in';
+        readonly encoding: 'base64';
+        data: string;
+      } = {
+        after: transcript.sent.length,
+        stream: 'in',
+        encoding: 'base64',
+        data: '',
+      };
+      transcript.frames.push(frame);
+      pendingFrameReads.push(
+        raw.arrayBuffer().then((buf) => {
+          frame.data = encodeBinaryBase64(buf);
+        }),
+      );
       return;
     }
     transcript.frames.push({
@@ -155,13 +176,14 @@ const recordWebSocket = (
         resolve();
       };
       socket.addEventListener('close', onClose);
-    }).then(() =>
-      recorder.storeCassette(
+    }).then(async () => {
+      await Promise.all(pendingFrameReads);
+      return recorder.storeCassette(
         cassettePath,
         { transport: 'websocket', status: 101, body: transcript },
         { transport: 'websocket', durationMs: Date.now() - started },
-      ),
-    ),
+      );
+    }),
   );
 
   const originalSend = socket.send.bind(socket);
