@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "check": "bun run typecheck && bun run lint && bun run test",
+    "check:all": "bun run typecheck && bun run lint && bun run test",
+    "check": "inixiative-config bounded -- bun run check:all",
     "prepublishOnly": "bun run check && bun run build"
   },
   "keywords": [
